@@ -761,3 +761,36 @@ clean, non-narrative version of this whole spec is `isa.md` — that's the
 actual Phase 1 deliverable. One item genuinely deferred to Phase 2,
 non-blocking: `load-stationary`'s re-issue frequency (§5.5's open
 thread) — affects instruction count, not any field width.
+
+### 8.5 Post-completion review: two real clarifications caught, no field changes
+
+Reviewing the finished spec surfaced two places where the *description*
+was imprecise even though the underlying field counts were already
+correct — both patched directly into `isa.md`, logged here for the
+record.
+
+**`load-K/V`'s dest-select bit does double duty.** Originally described
+as a scratchpad-side selector only. Caught: K and V are different HBM
+tensors with two genuinely separate hardcoded bases (`K-base`, `V-base`)
+— "hardcode the base" was underspecified, since there are two bases, not
+one combined "K/V base." Resolution: the K-vs-V half of the existing
+2-bit `dest-select` field also drives an HBM-side mux (`selected_base =
+K-vs-V ? V-base : K-base`), in addition to picking the scratchpad
+destination — same field, two pieces of address-generation hardware
+consuming it, no new bits. Same pattern as `steady-state-stream-v`'s
+single head-idx resolving two different bases for source vs. destination
+(§6.3) — this is a third instance of that shape.
+
+**`load-Q`/`store-O` are one instruction type occurring 8×, not "8
+separate instructions."** A conversational imprecision, not a doc error —
+`isa.md` already correctly says "issued 8× per Q-tile transition (once
+per head)," which is unambiguous. Worth noting anyway since the
+distinction matters: it's the exact same "one opcode, many per-head
+occurrences" pattern every other instruction in this ISA uses
+(`steady-state-stream-qk`, `softmax-update`, etc.) — not a special
+multi-opcode DMA construct. head-idx being an ISA-visible field (rather
+than invisible, internal to a bulk-transfer instruction) is a consequence
+of *choosing* per-occurrence issuance over the strided-descriptor
+alternate (§7.4) — not an unavoidable fact of HBM non-contiguity by
+itself. The strided-descriptor alternate would have solved the same
+non-contiguity problem without ever exposing head-idx as a field.
