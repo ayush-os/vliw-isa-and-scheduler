@@ -145,6 +145,7 @@ side.
 | HBM offset | 11 bits | `log2(32 batches × 8 groups × 8 chunks)` — identifies which (batch, KV-group, chunk) is being fetched. |
 | dest-select | 2 bits | 1 bit K-vs-V + 1 bit buffer-select (1-or-2) — same 2-bit scheme as `load-stationary`'s source selector, just now on the write side. |
 
+- **The K-vs-V bit does double duty.** K and V are different tensors in HBM with two genuinely separate hardcoded bases (`K-base`, `V-base`) — there is no single combined "K/V base." The K-vs-V half of `dest-select` drives a small mux on the HBM side too (`selected_base = K-vs-V ? V-base : K-base`, then `HBM address = selected_base + offset`), in addition to picking the scratchpad destination region. The buffer-select half (1-or-2) is scratchpad-only — double-buffering doesn't affect the HBM source, since both buffer slots for K pull from the same K tensor. No extra field needed; the existing 2 bits just get consumed by two different pieces of address-generation hardware.
 - Issued **1× per chunk transition** — no head-idx, since a K/V chunk is shared across the whole 8-head group by construction (the entire GQA-reuse mechanism).
 - HBM read is a simple contiguous burst — for fixed (batch, kv-head), `tile_k` consecutive sequence positions × the full `d_head` range is contiguous in standard row-major layout. No gather problem, unlike Q/O.
 
