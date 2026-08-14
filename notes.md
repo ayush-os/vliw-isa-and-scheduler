@@ -297,6 +297,10 @@ rather than copied from it.
   accumulator address. No length field — always exactly `tile_q`=32 (fixed
   under the Decision 2 fixed-shape idealization; `seq_len_q`/`tile_q` =
   8192/32 = 256 divides evenly, no ragged remainder to worry about).
+  **Superseded — see §6.3.** This single-instruction field list turned out
+  to be wrong once the SFU slot's derivation forced a closer look: the
+  destination isn't uniform across this instruction's two real uses. Kept
+  here as the historical record of the original (incomplete) design.
 - **No dataflow-select field**, confirmed still applicable (§4.6, carried
   over from Phase 0).
 - **No transpose bits** — see §5.3, this took real derivation (and one
@@ -369,3 +373,291 @@ concrete mechanism in plain language, give it plainly. When directly asked
 — that's not the same as doing the derivation *for* them unprompted;
 asking for a recommendation on a judgment call is a different request
 than skipping their own derivation entirely.
+
+### 5.5 Loop order within a Q-tile: chunk outer, head inner
+
+Surfaced while working the vector/scalar-unit (SFU) slot's field list —
+specifically, while checking whether `steady-state-stream`'s Q source
+address could collapse to a single fixed/reused buffer the same way raw-S
+turned out to (§6, once written up). Recorded here since it's a property
+of the loop nest itself, not specific to one slot — it constrains both
+`steady-state-stream`'s addressing (this section) and the SFU slot's.
+
+**Finding**: within one Q-tile-iteration, the loop order is **K/V-chunk
+outer, head inner** — not the reverse.
+
+**Derivation**:
+- §2.2's K/V-stationary GQA reuse mechanism means one `load-stationary`
+  call (one K/V chunk into the array) gets reused across all 8 heads
+  sharing that KV group before the array reloads a new chunk — that reuse
+  *is* the mechanism, so for one loaded chunk, all 8 heads get processed
+  before the next chunk load. Chunk is outer relative to head.
+- Combined with §2.5's already-established "cycling all 8 chunks" within
+  one Q-tile (Q-tile outer relative to K/V-chunk): the full nest for one
+  Q-tile is **for each of 8 chunks: for each of 8 heads: process**.
+
+**Consequence for addressing**: a given head gets revisited 8 separate
+times within one Q-tile-iteration (once per chunk pass) before that Q-tile
+finishes. So a head's Q data can't be treated as a single transient buffer
+loaded once and discarded the way raw-S/P are (produced and consumed once
+per sub-pass, then overwritten) — it has to stay resident across the
+*entire* Q-tile-iteration. That means **8 simultaneously-live per-head Q
+buffers**, addressed via the same 3-bit head-index as the per-head
+accumulator state — not collapsible to a single fixed zero-bit address the
+way raw-S/P are. Direct implication: `steady-state-stream`'s QK^T-mode
+source address needs the head-index; only its destination (raw S) and the
+·V-mode's source (P) collapse to zero bits.
+
+*(Correction, §6.2: P does **not** actually collapse to zero bits — that
+was wrong by analogy with raw-S. See §6.2 Correction 3.)*
+
+---
+
+## 6. Phase 1 — ISA Definition: Vector/Scalar-Unit (SFU) Slot, and Corrections to Matmul-Issue
+
+Full derivation involved a long real back-and-forth with several genuine
+self-corrections — recorded here rather than smoothed over, per this
+project's own standard (`prefill_notes.md`'s own framing: "self-corrections
+and wrong turns are kept where they carried real signal"). The corrections
+turned out to be as load-bearing as the initial design.
+
+### 6.1 Two instruction types, from the actual online-softmax recurrence
+
+Standard online (Flash-Attention-style) softmax, per head, iterating over
+the 8 K/V chunks `j=1..8` within one Q-tile. Initial state `m_0=-inf,
+l_0=0, O_0=0`. Given `S_j = Q_tile · K_j^T` (produced by the matmul slot,
+not SFU):
+
+**softmax-update** (once per chunk):
+```
+m_j     = max(m_{j-1}, rowmax(S_j))
+P_j     = exp(S_j - m_j)                    → scratchpad
+alpha_j = exp(m_{j-1} - m_j)
+l_j     = alpha_j · l_{j-1} + rowsum(P_j)
+O_j     ← alpha_j · O_{j-1}                  rescale only — the += P_j@V_j
+                                              add is steady-state-stream-v's job
+```
+
+**softmax-finalize** (once, after chunk 8):
+```
+O_final = O_8 / l_8
+```
+
+Matches real Gemmini's `Normalizer` (`prefill_notes.md` §4.5) split
+exactly: running max/sum + max-subtracted `iexp` is update-side hardware,
+the hardfloat `1/sum` divide is separate finalize-side hardware.
+
+### 6.2 Field derivation, including the real corrections
+
+Starting point (wrong): assumed `softmax-update` needed a full
+`accum_src_addr` (raw S) + a full `scratchpad_dst_addr` (P).
+
+**Correction 1 — "which head" needs a field, but not for the reason first
+given.** Initial reasoning ("the loop is fixed, so no field needed") was
+too broad — Decision 2's own point is that fixed/compile-time-known
+doesn't mean operand-free (that's exactly what separates this project's
+static bet from a naive one). The real mechanism: the persistent per-head
+state (`m`, `l`, `O`) genuinely occupies 8 distinct addresses (§2.3's `×8`
+sizing term), so a 3-bit head-index is real and necessary.
+
+**Correction 2 — a naming trap hid the actual gap.** `accum_src_addr` was
+quietly doing two different jobs across two instructions: on
+`softmax-finalize` it correctly meant "the per-head state block" (does
+vary by head). On `softmax-update` it actually meant "the raw-S buffer" —
+which turned out to be a single fixed, reused accumulator location
+(produced by `steady-state-stream-qk`, consumed by the very next
+instruction, same head, no reload gap in between) — zero bits, not
+per-head. So `update`'s real head-index need came from a field that had
+gone unlisted (the per-head metadata), not from the field originally
+assumed to carry it.
+
+**Correction 3 — P is not fixed like raw-S.** Initially assumed (by
+analogy with raw-S's "one reused buffer, not ×8" wording in §2.3) that P
+also collapses to zero bits. Wrong: P's producer (`softmax-update`, during
+the K-stationary phase) and consumer (`steady-state-stream-v`, during the
+V-stationary phase) are separated by a hardware-forced reload boundary —
+the array can only hold one stationary operand (K or V) at a time (§2.1's
+shared-array finding), so all 8 heads' QK^T+update work finishes under
+K-stationary before any ·V work can begin under V-stationary. All 8 heads'
+P values must therefore coexist simultaneously, not one-at-a-time like raw
+S. **Real correction to `prefill_notes.md` §2.3's own budget**: that phase
+assumed a single reused 4,096 B P buffer when solving for `tile_k`; the
+real requirement is `×8` = 32 KB (per-head P is `tile_q×128` = 4,096 B,
+not the 1024×128 K/V-chunk size — a real number mix-up caught mid-session).
+Checked against the 1 MiB ceiling: K/V's double-buffered term already uses
+524,288 B + Q/output's 8,192 B = 536,576 B, leaving ~512 KB slack — the
+extra 28 KB fits, `tile_k`=1024 still stands, but the original hypothesis's
+P-sizing assumption was incomplete. (Not edited into `prefill_notes.md`
+itself — that's a different, already-completed project's polished
+deliverable; recorded here as where the gap was actually found.)
+
+**Correction 4 — Q needs the same ×8 treatment as P, for a different
+mechanistic reason.** Surfaced while checking whether
+`steady-state-stream-qk`'s Q-source could also collapse to zero bits like
+raw-S. It can't: K/V-stationary GQA reuse (§2.2) means one
+`load-stationary` call is reused across all 8 heads before the array
+reloads — so within one Q-tile, the loop order is chunk-outer/head-inner
+(§5.5), and a given head gets revisited once per chunk (8 times) before
+the Q-tile finishes. Q data has to stay resident the whole time, not get
+discarded after one use — ×8 residency, head-indexed. (§2.4's own "(c)
+K/V double-buffered, Q/output not" confirms Q doesn't need the extra
+double-buffer bits `load-stationary` needed, just the head-index.)
+
+**Correction 5 — `softmax-update`'s full read/write set, corrected late.**
+Two more misses: `softmax-update` never *writes* S (only reads it — the
+next `steady-state-stream-qk` call is what overwrites it, not `update`),
+and `update` *does* touch the output accumulator (the `alpha_j · O_{j-1}`
+rescale step), which was initially missed entirely.
+
+- **Reads**: S (fixed, zero bits), metadata (`m`,`l` — head-idx), output
+  (`O` — head-idx)
+- **Writes**: metadata (head-idx), output (head-idx, rescale written in
+  place), P (head-idx)
+
+### 6.3 Bifurcation of `steady-state-stream` into two opcodes
+
+Corrected from the original single `steady-state-stream` (§5.1/§5.2) once
+the asymmetry above was traced through: its destination is zero-bit (raw
+S) in QK^T-mode but head-indexed (output accumulator) in ·V-mode — not one
+uniform field. Split into `steady-state-stream-qk` and
+`steady-state-stream-v`. Both now happen to have identical field shape
+(3-bit head-index only) — kept as separate opcodes anyway, because the
+opcode itself is what tells the hardware which pair of hardcoded base
+addresses (Q-base/S-base vs. P-base/output-base) to combine with that
+index; the bit-width matching is coincidental, the operation and
+addressing target genuinely differ.
+
+### 6.4 Final field table, both slots
+
+| Instruction | Fields |
+|---|---|
+| `load-stationary` | opcode + 5-bit src (2-bit buffer-select {K1,K2,V1,V2} + 3-bit slice-idx within the chosen 1024×128 double-buffered chunk) |
+| `steady-state-stream-qk` | opcode + 3-bit head-idx (Q source; S destination fixed, zero bits) |
+| `steady-state-stream-v` | opcode + 3-bit head-idx (services both P source and output destination, different hardcoded bases) |
+| `softmax-update` | opcode + 3-bit head-idx (S read-only and fixed; metadata + output + P all head-idx'd) |
+| `softmax-finalize` | opcode + 3-bit head-idx (reads metadata+output, writes output only) |
+
+Bit-widths for the *base* addresses themselves (not the small index fields
+derived here) remain deferred to the single combined pass across all three
+Phase 1 slots, per §5.2's original plan — now to happen once DMA is
+defined.
+
+### 6.5 Correction: `softmax-finalize`'s destination moves from accum to scratchpad
+
+Surfaced while scoping the DMA slot (§7): DMA should be HBM↔scratchpad
+only, never accum-facing. Reasoning: every accum touch in this ISA already
+has a direct compute-unit port (matmul writes raw S; SFU reads raw S,
+reads/writes metadata+output, writes P) — the same pattern real Gemmini
+uses (`ex_read_from_acc`/`ex_write_to_spad`, §4.3, kept separate from
+`mvin`/`mvout`, which are strictly scratchpad-facing). Giving DMA a special
+accum-facing path just to ship the final output would mean inventing a
+hardware capability beyond anything the real reference hardware actually
+has, and would cost DMA a memory-type selector field on top of its
+addressing — not worth it for one case.
+
+**Resolution**: `softmax-finalize` now writes `O_final` to a dedicated
+scratchpad region (sized for the 8 per-head output tiles) instead of back
+into the accumulator. Reads are completely unaffected — `l` and `O` still
+come from the accumulator, same as before. Only the destination's
+hardcoded base changes (`output-accum-base` → `output-scratch-base`); the
+same 3-bit head-index still resolves it. No field added, no width change.
+
+**Updated field table entry**: `softmax-finalize` — opcode + 3-bit
+head-idx; reads accum (metadata `l` + output `O`), writes **scratchpad**
+(output). This is what DMA now picks up as one of its store sources.
+
+---
+
+## 7. Phase 1 — ISA Definition: DMA Slot
+
+### 7.1 Scoping: exactly 4 real cases, HBM↔scratchpad only
+
+DMA's job is load Q, load K, load V, store O — nothing else. Grounded in
+the fused regime (`prefill_notes.md` §1.2/§1.4): P and raw S never touch
+HBM at all, so those never need DMA. And DMA never touches the
+accumulator directly, matching real Gemmini's own separation
+(`ex_read_from_acc`/`ex_write_to_spad` vs. `mvin`/`mvout`, §4.3) — every
+accum interaction in this ISA already has a direct compute-unit port
+(matmul writes raw S; SFU reads raw S, reads/writes metadata+output,
+writes P). This scoping decision is what forced the `softmax-finalize`
+correction in §6.5 above (its destination had to move to scratchpad,
+since DMA has nowhere else to pick the final output up from).
+
+### 7.2 Instruction count: 3, not 4 — K and V merge, mirroring `load-stationary`
+
+Applied the exact same test that decided `load-stationary` handles both K
+and V with one opcode: do the destination fields structurally differ
+enough to force separate opcodes (the way `steady-state-stream` eventually
+did), or is it "different address, same shape"? K and V's destinations
+are both a 1-bit buffer-select into their own fixed base — identical
+shape — so they merge into `load-K/V`. Q's destination shape (a 3-bit
+head-index into 8 simultaneously-live slots) genuinely differs, so it
+stays a separate opcode. Final: `load-Q`, `load-K/V`, `store-O`.
+
+### 7.3 HBM addressing: hardcode the tensor base, carry a real offset
+
+Initial framing (too strong): DMA needs a "full explicit HBM address."
+Corrected: exactly like every scratchpad field in §5–§6, hardcode the
+per-tensor HBM base (Q-base/K-base/V-base/O-base are compile-time-known
+constants) and carry only the **offset** to the specific slice being
+fetched. But unlike the scratchpad fields (which collapsed to 2–3 bits
+because there were only a handful of *physical* destinations ever), the
+offset has to distinguish every *logical* position DMA will ever be asked
+to fetch across the whole program — a real, non-trivial bit count:
+
+- **Q/O offset**: `32 batches × 8 groups × 256 Q-tiles` = 2¹⁶ → **16 bits**.
+- **K/V offset**: `32 batches × 8 groups × 8 chunks` = 2¹¹ → **11 bits**.
+
+Checked against §2.5's re-fetch finding: K/V's offset correctly has no
+Q-tile component, since a given (batch, group, chunk) always resolves to
+the identical HBM address regardless of which Q-tile triggered the fetch
+— consistent with *why* the 256× re-fetch is wasteful in the first place,
+not a reason to add bits.
+
+### 7.4 The real catch: `load-Q`/`store-O` can't be one bulk transfer as first assumed
+
+Initial assumption: DMA moves bulk data, so one `load-Q` instruction
+should fetch all 8 heads' Q-tile data at once, destination collapsing to
+zero bits the same way `steady-state-stream-qk`'s raw-S destination did.
+**Never checked whether that's mechanically possible.** It isn't: Q's HBM
+layout is `(batch, n_heads, seq_len, d_head)` — for a fixed (batch,
+Q-tile-position), the 8 heads sharing one KV-group live at 8 *separated*
+locations (each `seq_len × d_head` apart), not one contiguous block. A
+single simple DMA burst can't cover that. Same problem, symmetrically, for
+`store-O`.
+
+Three options considered:
+1. A strided/gather DMA descriptor (one instruction, internally loops 8×) — real precedent (Gemmini's own `mvin` supports striding), but a genuine new hardware capability (an address-generation unit for strided access).
+2. Per-head instructions, compiler embeds 8 fully-distinct raw addresses.
+3. A layout-assumption escape hatch (pre-arrange Q/O in HBM so heads are contiguous) — pushes cost onto an unaccounted-for preprocessing step.
+
+**Resolution (better than any of the three)**: keep it one opcode, issued
+8× per Q-tile (once per head), with a 3-bit head-idx — but **hardware**
+computes the HBM address via `head_base + head_idx × (seq_len×d_head)`,
+the exact same base+idx×stride mechanism every other head-indexed field
+in this ISA already relies on for scratchpad addressing, just extended to
+the HBM side. This is strictly better than option 1 (no new hardware
+capability — it's the same address-generation logic already needed
+elsewhere, not a new strided-DMA engine) and more precise than option 2
+(the 16-bit offset stays identical across all 8 head-instructions; only
+the 3-bit head-idx changes, rather than the compiler carrying 8 fully
+independent addresses). Applies identically to `store-O`.
+
+### 7.5 Final field table, DMA slot
+
+| Instruction | Fields | Issued |
+|---|---|---|
+| `load-Q` | opcode + 16-bit HBM offset + 3-bit head-idx | 8× per Q-tile |
+| `load-K/V` | opcode + 11-bit HBM offset + 2-bit dest-select (K-vs-V + buffer-select) | 1× per chunk |
+| `store-O` | opcode + 3-bit head-idx + 16-bit HBM offset | 8× per Q-tile |
+
+### 7.6 Phase 1 complete — see `isa.md` for the consolidated deliverable
+
+All three slots (matmul-issue §5–§6.4, SFU §6, DMA §7) are now fully
+field-derived, 8 instruction types total. The clean, non-narrative
+version of this whole spec (without the correction history) is written up
+as `isa.md` — that's the actual Phase 1 deliverable `spec.md` calls for.
+Explicitly deferred to Phase 2 kickoff: bit-widths for the hardcoded base
+addresses/opcode field itself, and the bundle-layout tradeoff
+(fixed-width-per-slot vs. compact variable — `spec.md`'s own "primary
+hypothesis + explicit alternate" requirement, not yet done).
