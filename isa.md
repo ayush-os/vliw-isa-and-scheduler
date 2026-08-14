@@ -39,7 +39,10 @@ registers.
 
 ### `steady-state-stream-qk`
 Streams the current Q tile through the array (K currently stationary),
-producing raw S in the accumulator.
+producing raw S in the accumulator. One instance covers exactly one
+128-wide array sub-pass (`tile_k`/128 = 8 sub-passes per chunk, matching
+`load-stationary`'s slice-idx — `prefill_notes.md` §2.3's fine-grained
+softmax granularity) for one head — issued once per (chunk, slice, head).
 
 | Field | Width | Meaning |
 |---|---|---|
@@ -52,7 +55,8 @@ producing raw S in the accumulator.
 
 ### `steady-state-stream-v`
 Streams the current P tile through the array (V currently stationary),
-accumulating into the output.
+accumulating into the output. Same per-(chunk, slice, head) granularity as
+`-qk`.
 
 | Field | Width | Meaning |
 |---|---|---|
@@ -61,6 +65,7 @@ accumulating into the output.
 
 - No length field, no dataflow-select field, transpose permanently disengaged (same reasoning as `-qk`).
 - Kept as a separate opcode from `-qk` despite now having an identical field shape (both just head-idx): the opcode is what tells hardware *which pair* of hardcoded bases to combine with the index — the underlying operation and addressing target genuinely differ, the bit-width match is coincidental.
+- **Head-idx-only addressing for P requires a specific scheduling constraint, decided here rather than left to Phase 2** (`notes.md` §9.4): each 128-wide slice's K-phase (`steady-state-stream-qk` + `softmax-update` for all 8 heads) must be immediately followed by that *same* slice's V-phase (`steady-state-stream-v` for all 8 heads) before the next slice begins — never batching multiple slices' K-phases before their V-phases. This keeps only one slice's 8 P-values alive at a time. Batching would need a 6th field (a slice-idx alongside head-idx, and asymmetrically so, since O's addressing would stay head-idx-only) for zero offsetting benefit — total array-reload count is identical either way.
 
 ---
 
@@ -88,6 +93,9 @@ running max/sum + max-subtracted `iexp` is update-side hardware, the
 hardfloat `1/sum` divide is separate finalize-side hardware.
 
 ### `softmax-update`
+Issued once per (chunk, slice, head) — one 128-wide array sub-pass'
+contribution for one head, matching `steady-state-stream-qk`'s granularity
+(`prefill_notes.md` §2.3's fine-grained softmax finding).
 
 | Field | Width | Meaning |
 |---|---|---|
@@ -96,6 +104,11 @@ hardfloat `1/sum` divide is separate finalize-side hardware.
 
 - **Reads**: S (fixed accumulator location, zero bits, read-only — never written by this instruction), metadata (head-idx), output `O` (head-idx).
 - **Writes**: metadata (head-idx), output `O` (head-idx — rescale written in place), P (scratchpad, head-idx).
+- `m`/`l`/`O` are persistent, incrementally-updated state — exactly one
+  instance per head regardless of scheduling. **P is not** — it's a fresh
+  value per (head, slice), and staying at 3-bit head-idx (rather than
+  needing a slice-idx too) depends on the slice-interleaved scheduling
+  constraint described under `steady-state-stream-v` above.
 
 ### `softmax-finalize`
 
@@ -171,24 +184,28 @@ whether or not a given slot has real work that cycle (idle slots encode a
 NOP).
 
 **Why fixed over compact/variable, checked rather than assumed**: real
-per-Q-tile instruction counts are matmul-issue=144, SFU=72, DMA=32 (§7.2
-derivation) — i.e. even under a best-case schedule bottlenecked by
-matmul-issue, SFU is idle ~50% of cycles and DMA ~78%. So this is *not*
-"every slot is always busy" (that intuition doesn't hold up against the
-real numbers) — it's a deliberate choice despite the idle-slot cost,
-because: (1) the cost is code-density/storage, not throughput — an idle
-slot doesn't cost a cycle, just unused bits in that cycle's bundle; (2)
-fixed-offset decode is real hardware simplicity, consistent with this
-project's standing preference for minimal control hardware over marginal
-efficiency (the DMA-scoping and stride-computation decisions made the same
-tradeoff); (3) direct precedent — Groq's own dispatch is described as
-"144-wide VLIW instructions" (§1.3), a fixed format, in a chip whose whole
-thesis is minimal ICU area. **Explicit alternate**: a compact/variable
-scheme (active-slot bitmask + only-present-slots' fields) would recover
-most of that idle-slot waste, at the cost of variable-length decode — the
-real tradeoff to revisit if code density ever becomes the actual
-bottleneck (e.g. if Phase 2's fully-unrolled program turns out to be far
-larger than instruction memory can hold).
+per-Q-tile instruction counts, accounting for the fine-grained per-128-wide-
+slice softmax granularity (`prefill_notes.md` §2.3 — 8 slices per chunk,
+matching `load-stationary`'s slice-idx field), are matmul-issue=1,152,
+SFU=520, DMA=32 (≈36:16:1) — i.e. even under a best-case schedule
+bottlenecked by matmul-issue, SFU is idle ~55% of cycles and DMA ~97%. So
+this is *not* "every slot is always busy" (that intuition doesn't hold up
+against the real numbers, and holds up even less once the real slicing
+granularity is counted correctly) — it's a deliberate choice despite the
+idle-slot cost, because: (1) the cost is code-density/storage, not
+throughput — an idle slot doesn't cost a cycle, just unused bits in that
+cycle's bundle; (2) fixed-offset decode is real hardware simplicity,
+consistent with this project's standing preference for minimal control
+hardware over marginal efficiency (the DMA-scoping and stride-computation
+decisions made the same tradeoff); (3) direct precedent — Groq's own
+dispatch is described as "144-wide VLIW instructions" (§1.3), a fixed
+format, in a chip whose whole thesis is minimal ICU area. **Explicit
+alternate**: a compact/variable scheme (active-slot bitmask +
+only-present-slots' fields) would recover most of that idle-slot waste, at
+the cost of variable-length decode — the real tradeoff to revisit if code
+density ever becomes the actual bottleneck (e.g. if Phase 2's
+fully-unrolled program turns out to be far larger than instruction memory
+can hold — a real risk given there's no hardware loop construct at all).
 
 **Opcode widths** (mechanical, `ceil(log2(instruction count))` per slot,
 now that each slot has its own fixed field): matmul-issue (3 types) → 2
@@ -213,7 +230,7 @@ fixed position per slot, no parsing required to decode.
 | Region | Size |
 |---|---|
 | K1/K2/V1/V2 (double-buffered) | 524,288 B |
-| P (×8 heads — corrected, §6.2 Correction 3) | 32,768 B |
+| P (×8 heads, settled — corrected, `notes.md` §6.2 Correction 3 + §9.4) | 32,768 B |
 | Q (×8 heads — corrected, §6.2 Correction 4) | 32,768 B |
 | Output (×8 heads, int8 — corrected, §6.5 + §8) | 32,768 B |
 | **Total** | **622,592 B** (slack ≈ 416 KB) |
@@ -237,18 +254,20 @@ GiB GQA-fused total).
 
 ## 6. Summary table — all 8 instructions
 
-| Slot | Instruction | Fields | Slot width | Issued |
+| Slot | Instruction | Fields | Slot width | Issued (per Q-tile) |
 |---|---|---|---|---|
-| Matmul-issue | `load-stationary` | opcode(2) + 5-bit src (2-bit buffer-select + 3-bit slice-idx) | 7 bits | per K/V chunk |
-| Matmul-issue | `steady-state-stream-qk` | opcode(2) + 3-bit head-idx | 7 bits (padded) | per (chunk, head) |
-| Matmul-issue | `steady-state-stream-v` | opcode(2) + 3-bit head-idx | 7 bits (padded) | per (chunk, head) |
-| SFU | `softmax-update` | opcode(1) + 3-bit head-idx | 4 bits | per (chunk, head) |
-| SFU | `softmax-finalize` | opcode(1) + 3-bit head-idx | 4 bits | per (Q-tile, head), after last chunk |
-| DMA | `load-Q` | opcode(2) + 16-bit HBM offset + 3-bit head-idx | 21 bits | 8× per Q-tile |
-| DMA | `load-K/V` | opcode(2) + 11-bit HBM offset + 2-bit dest-select | 21 bits (padded) | 1× per chunk |
-| DMA | `store-O` | opcode(2) + 3-bit head-idx + 16-bit HBM offset | 21 bits | 8× per Q-tile |
+| Matmul-issue | `load-stationary` | opcode(2) + 5-bit src (2-bit buffer-select + 3-bit slice-idx) | 7 bits | per (chunk, slice, K-or-V) = 8×8×2 = **128** |
+| Matmul-issue | `steady-state-stream-qk` | opcode(2) + 3-bit head-idx | 7 bits (padded) | per (chunk, slice, head) = 8×8×8 = **512** |
+| Matmul-issue | `steady-state-stream-v` | opcode(2) + 3-bit head-idx | 7 bits (padded) | per (chunk, slice, head) = **512** |
+| SFU | `softmax-update` | opcode(1) + 3-bit head-idx | 4 bits | per (chunk, slice, head) = **512** |
+| SFU | `softmax-finalize` | opcode(1) + 3-bit head-idx | 4 bits | per head, after last chunk = **8** |
+| DMA | `load-Q` | opcode(2) + 16-bit HBM offset + 3-bit head-idx | 21 bits | 8× per Q-tile = **8** |
+| DMA | `load-K/V` | opcode(2) + 11-bit HBM offset + 2-bit dest-select | 21 bits (padded) | 1× per chunk × 2 (K,V) = **16** |
+| DMA | `store-O` | opcode(2) + 3-bit head-idx + 16-bit HBM offset | 21 bits | 8× per Q-tile = **8** |
 
-**Total bundle: 32 bits** (7 + 4 + 21, fixed-width-per-slot, §4).
+**Total bundle: 32 bits** (7 + 4 + 21, fixed-width-per-slot, §4). Per-slot
+totals: matmul-issue = 1,152, SFU = 520, DMA = 32 (`notes.md` §9.3 — the
+slicing granularity that was missing from the first pass of this count).
 
 **Notable emergent property**: every head-touching instruction across
 *all three* slots ends up issued exactly once per head — never bulk,
@@ -258,15 +277,15 @@ for matmul/SFU, HBM contiguity for DMA).
 
 ---
 
-## 7. Explicitly deferred (not forgotten) — the one item left for Phase 2
+## 7. Explicitly deferred (not forgotten) — status
 
 Everything required for the Phase 1 deliverable (`spec.md`'s "address-field
 widths sized to real capacity, immediate operand widths, bundle layout
-stated and defended") is now done — bit-widths and bundle format above.
-One item remains, genuinely non-blocking:
+stated and defended") is done — bit-widths and bundle format above.
 
-- **`load-stationary` re-issue frequency**: whether it's issued once per
-  128-wide slice per chunk-load (reused across all 8 heads before the
-  next slice) — doesn't change any field width, only how many
-  instructions Phase 2 ends up emitting. Fine to resolve as part of
-  Phase 2's own scheduling work.
+`load-stationary`'s re-issue frequency — previously listed here as
+deferred — is now **resolved**, not open: once per (chunk, slice,
+K-or-V), reused across all 8 heads before the next slice (`notes.md`
+§9.2's corrected loop nest). This is what drove the whole §4/§6
+correction (§9). Nothing left deferred at the ISA-definition level; Phase
+2 starts from a complete spec.
