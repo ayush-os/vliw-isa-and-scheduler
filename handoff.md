@@ -185,6 +185,34 @@ is made and written up in `isa.md`. Next: Phase 2 itself — hand-scheduled
 bundle sequence first, then the automated scheduler, both against
 `isa.md` (per `spec.md`, updated after Phase 0 to require both).
 
+### Post-completion correction found while reconstructing the loop nest in the Phase 2 session (`notes.md` §9)
+
+Worth knowing before trusting any instruction-count number from earlier
+in this file or from memory of this project: the original bundle-layout
+justification (144:72:32 matmul:SFU:DMA) used *coarse* granularity for
+`steady-state-stream-qk/v` and `softmax-update` — one call per (chunk,
+head) — when `prefill_notes.md` §2.3 already establishes softmax runs
+**fine-grained, per 128-wide array sub-pass** (8 slices per chunk,
+exactly matching `load-stationary`'s slice-idx field, which *was*
+correctly designed around this from the start). No field or bit-width was
+actually wrong — only the issuance counts and loop-nest documentation
+were. Corrected ratio: **1,152:520:32** (≈36:16:1). The fixed-width
+bundle-layout conclusion still holds (the reasoning was never
+ratio-dependent), just with more extreme idle-slot waste than originally
+stated.
+
+This also forced one real decision that had gone unmade: whether P's
+residency is ×8 or ×64 depends on whether the K/V phases interleave per
+slice or batch across the whole chunk — and unlike a pure scheduling
+choice, this one changes field counts (`softmax-update`/
+`steady-state-stream-v` would need a 6th field, a slice-idx, under
+chunk-batching). Settled here as slice-interleaved (identical reload
+count either way, so batching buys nothing) — P-residency is genuinely
+×8, not conditional; full reasoning in `notes.md` §9.4. `isa.md` §3/§4/§6
+and `notes.md` §9 are the current, correct state — anything computed
+before this correction (including earlier in this file, if you're reading
+an old version) is superseded.
+
 ## Files in this repo
 
 - `spec.md` — the project spec (source of truth for phase structure/
