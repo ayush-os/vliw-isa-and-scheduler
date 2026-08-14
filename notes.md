@@ -916,3 +916,51 @@ qk/v`'s head-idx-only fields, `softmax-update/finalize`'s fields, the
 §8.2 (which already used the correct fine-grained per-slice P size,
 4,096 B — that number was never wrong, only the *count* of simultaneous
 instances was left ambiguous) all stand as written.
+
+---
+
+## 10. Cross-project confirmation: GQA's benefit here is array-level reuse, not HBM bandwidth
+
+Surfaced by comparing Q's and K/V's HBM-fetch-to-compute reuse ratios —
+only possible to see clearly once §9's corrected per-slice counts were in
+hand.
+
+**Finding**: Q and K/V both achieve **64× compute-reuse per HBM fetch** in
+this design. Q: one `load-Q` fetch (per head) is reused across 8 chunks ×
+8 slices = 64 `steady-state-stream-qk` calls, since Q persists unchanged
+across the whole K-sweep for a fixed head. K/V: one `load-K/V` fetch (per
+chunk) is reused across 8 slices × 8 heads = 64 calls, since GQA-group
+sharing lets one loaded chunk serve all 8 heads, and `load-stationary`
+further sub-passes it into 8 slices. Numerically tied — but a coincidence
+(both dimensions happen to be 8), not structural necessity, per the
+reuse-tie discussion above.
+
+**What breaks the tie open — the MHA counterfactual**: without GQA
+(`n_kv_heads`=64, no group sharing), K/V's reuse would only be 8× (8
+slices × 1 head, no cross-head sharing) — Q's 64× is independent of GQA
+entirely, so under MHA, K/V would be markedly worse-amortized than Q.
+**GQA's real, measurable effect is closing exactly that gap** — bringing
+K/V's array-level reuse from 8× up to 64×, precisely the GQA group size —
+but the benefit is realized entirely **on-chip**, inside
+`load-stationary`'s stationary-reuse mechanism across the 8-head group. It
+never reduces HBM/DMA traffic: `load-K/V` still refetches from HBM once
+per Q-tile regardless of how well the array reuses that data within one
+Q-tile.
+
+**This independently confirms, via a completely different method
+(instruction-issuance counting, not byte-counting), two findings already
+on record in `prefill_notes.md`**:
+- §2.5's "Major Open Finding" — K/V gets re-fetched ~256× (once per
+  Q-tile) instead of once per group; GQA's theoretical HBM-byte savings
+  never materializes under this tiling scheme.
+- Phase 1a Key Takeaway #7 — "GQA's real prefill payoff is
+  scratchpad/KV-cache pressure, not throughput"; fused prefill is
+  compute-bound, so GQA's bytes reduction doesn't reduce execution time,
+  its actual benefit sits elsewhere.
+
+Two independent derivations — byte-counting in the sibling
+hardware-hypothesis project, instruction-counting in this project's own
+ISA — landing on the identical conclusion is the same kind of
+cross-validation this whole project has valued throughout (direct
+precedent: the online-softmax mechanism, independently derived, then
+confirmed against Gemmini's real `Normalizer`, `prefill_notes.md` §4.5).
