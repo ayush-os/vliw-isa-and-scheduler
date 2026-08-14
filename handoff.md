@@ -145,22 +145,45 @@ small and enumerable (collapses to a compact index) or genuinely large
   — worth remembering that a downstream slot's scoping decision reached
   back and changed an already-"settled" earlier instruction.
 
-### Explicitly deferred to Phase 2 kickoff — first things to do in a new session
+### Encoding pass: also done — bundle layout + full sizing (notes.md §8)
 
-- **Bit-widths for the hardcoded base addresses themselves** (opcode field
-  width, actual scratchpad/HBM base constants) — the combined pass across
-  all three slots, planned since §5.2, now unblocked since all three slots
-  are fully defined. This was deliberately *not* done yet.
-- **Bundle layout**: fixed-width-per-slot vs. a more compact variable
-  scheme — `spec.md`'s own required "primary hypothesis + explicit
-  alternate" tradeoff (same discipline `prefill_notes.md` §2.1 used for
-  array width). Not started.
-- **`load-stationary` re-issue frequency** — flagged, not blocking, doesn't
-  change any field width, only instruction count in Phase 2's actual
-  bundle sequences.
-- **Then**: Phase 2 itself — hand-scheduled bundle sequence first, then
-  the automated scheduler, both against this same `isa.md` (per `spec.md`,
-  updated after Phase 0 to require both).
+The bit-widths and bundle-layout items that were still open as of the
+first Phase-1-complete pass are now resolved too:
+
+- **Bundle layout: fixed-width-per-slot**, chosen only after checking real
+  per-slot issuance rates rather than assuming — matmul-issue:SFU:DMA per
+  Q-tile ≈ 144:72:32, meaning even a best-case schedule leaves DMA idle
+  ~78% of cycles. The "pipelining keeps every slot busy" intuition that
+  motivated this doesn't actually hold up against the numbers — the
+  fixed-width conclusion stands anyway, for different reasons (idle-slot
+  cost is storage/code-density, not throughput; decode simplicity matches
+  this project's standing preference for minimal control hardware; direct
+  Groq precedent — "144-wide VLIW instructions," a fixed format). Compact/
+  variable is the stated explicit alternate, worth revisiting only if code
+  density becomes the real bottleneck (this design has zero hardware loop
+  construct, so a fully-unrolled program could get large).
+- **Full capacity/sizing pass** — surfaced two more real gaps in the same
+  shape as the P-sizing correction: `prefill_notes.md` §2.3's original
+  "fixed Q/output (8,192 B)" scratchpad term assumed both were small
+  transient buffers, but Q needs ×8 per-head residency (loop-order-driven,
+  same as P) and output needs its own ×8 region too (post-`finalize`
+  destination correction), at int8 not fp32 (fp32 was only ever needed
+  for softmax's internal stability). Real total: 65,536 B against the
+  original 8,192 B — still fits comfortably (full scratchpad/accumulator
+  tables in `isa.md` §5).
+- **Final bundle width: 32 bits** — 7 (matmul-issue) + 4 (SFU) + 21 (DMA),
+  opcode widths mechanical once layout is fixed.
+
+**One item genuinely deferred to Phase 2, non-blocking**:
+`load-stationary`'s re-issue frequency (whether it's issued once per
+128-wide slice per chunk-load, reused across all 8 heads before the next
+slice) — doesn't change any field width, only how many instructions
+Phase 2 ends up emitting.
+
+**Phase 1 is fully complete.** Every encoding decision `spec.md` requires
+is made and written up in `isa.md`. Next: Phase 2 itself — hand-scheduled
+bundle sequence first, then the automated scheduler, both against
+`isa.md` (per `spec.md`, updated after Phase 0 to require both).
 
 ## Files in this repo
 
