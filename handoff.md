@@ -77,72 +77,107 @@ Full reasoning, sources, and three background-reading summaries (Itanium/
 EPIC, TI C6000/Hexagon, Groq's real ISA) plus the Saman Amarasinghe
 "Compiler 2.0" lecture TLDR are all in `notes.md` §1.
 
-## Phase 1 progress: matmul-issue slot done, vector/scalar-unit slot next
+## Phase 1: COMPLETE — full ISA defined, all three slots, deliverable written
 
 Per `spec.md` Phase 1 — three slot types for prefill, each grounded in a
-specific prior finding, not invented from scratch. Full working log for
-everything below: **`notes.md` §5** — read that before continuing, this
-file is just the pointer + status.
+specific prior finding, not invented from scratch. **The clean deliverable
+is `isa.md`** — read that first for the actual spec (8 instruction types
+across matmul-issue/SFU/DMA, every field, no narrative). Full derivation
+and — importantly — **every real correction made along the way** is in
+`notes.md` §5–§7; read that before touching Phase 2, since the corrections
+carry real methodological lessons (below) that will recur in Phase 2's own
+derivation.
 
-**Matmul-issue slot: done.** Two instruction types (`load-stationary`,
-`steady-state-stream`), grounded in §2.1/§2.5's forced K/V-chunk-swap
-pattern. Settled fields: opcode, source scratchpad address for each
-(+ destination accumulator address for `steady-state-stream`), no length
-fields (both lengths are hardware/workload constants — 128 = array's
-physical PE count, 32 = `tile_q`), no dataflow-select field (§4.6), **and
-a real derived result worth remembering: zero explicit transpose bits in
-either instruction** — both instructions' transpose behavior turned out to
-be a fixed hardware fact (stationary operand always fans out across many
-PEs in one cycle → mismatches row-major storage → transpose permanently
-on; moving operand always funnels into one PE over many cycles → matches
-row-major → transpose permanently off), the same shape as the §4.6
-dataflow-is-a-compile-time-constant finding. Full derivation, including a
-real dead end (tried to resolve it via Gemmini's real A/B/D port
-semantics, which turned out to be genuinely unverifiable from
-`prefill_notes.md`'s own stated scope, §4.7/§6) and the eventual
-first-principles resolution that didn't need that mapping at all: `notes.md`
-§5.3. There's also a visual reference from this derivation — [**Fan-Out vs.
-Funnel**](https://claude.ai/code/artifact/b8690974-a2a6-4616-987a-e581ea3a81dd),
-an animated diagram of the fan-out-vs-funnel mechanism — worth a look if
-picking this back up cold.
+**Final structure**: 3 instructions in matmul-issue (`load-stationary`,
+`steady-state-stream-qk`, `steady-state-stream-v` — this one bifurcated
+from an original single `steady-state-stream`, see below), 2 in SFU
+(`softmax-update`, `softmax-finalize`), 3 in DMA (`load-Q`, `load-K/V`,
+`store-O`). 8 total.
 
-Bit-widths for matmul-issue's address fields are **deliberately deferred**,
-not forgotten — planned as one pass across all three slots' addressing
-needs together at the end of Phase 1, once vector/scalar and DMA are also
-defined, so widths get chosen consistently against the real scratchpad/
-accumulator capacities rather than piecemeal per slot.
+### The single biggest recurring lesson: compile-time-known ≠ operand-free
 
-**Next up: vector/scalar-unit slot** — the softmax sequence (max/exp/sum/
-normalize), using the online-softmax algorithm from `prefill_notes.md`
-§2.3/§4.5 (independently derived, then confirmed against Gemmini's real
-`Normalizer` module).
+This tripped up nearly every "does this field need to exist" question
+across all three slots until it became the default lens. Static/fixed-
+schedule does **not** mean an address disappears — it means the compiler
+computes it ahead of time instead of hardware computing it at runtime.
+That's Decision 2's own point (Itanium/Groq), and it kept resurfacing at
+the ISA level: a field only truly collapses to zero bits when the value is
+a genuine hardware/workload **constant** (always the same, every instance
+— e.g. array width, `tile_q`, dataflow, transpose). A value that's
+compile-time-*known* but **varies** across instances (which head, which
+buffer, which HBM offset) still needs real bits — just fewer than a naive
+full address, once you check whether the set of real destinations is
+small and enumerable (collapses to a compact index) or genuinely large
+(needs a real offset field, e.g. DMA's 16/11-bit HBM offsets).
 
-**Then: DMA slot** — tile load/store, sized against the real
-`tile_k=1024`/`tile_q=32` scratchpad budget (`prefill_notes.md` §2.3).
+### Other real corrections worth knowing before Phase 2 (full detail: `notes.md` §6.2, §7.4)
 
-**Then: the deferred encoding pass** — address-field widths (sized to the
-real scratchpad capacity, not arbitrary) and immediate operand widths for
-all three slots together, plus fixed-width-per-slot vs. compact variable
-bundle layout (state + defend the tradeoff, same "primary hypothesis +
-explicit alternate" discipline `prefill_notes.md` §2.1 used for array
-width).
+- **A field name silently meant two different things across two
+  instructions** (`accum_src_addr` = "the per-head state block" on
+  `softmax-finalize`, but = "the raw-S buffer" on `softmax-update`) and
+  that ambiguity hid a real missing field for several turns. Lesson: check
+  what a field *actually addresses* per-instruction, not just its name.
+- **P (post-softmax, scratchpad) needed ×8 per-head residency, not a
+  single reused buffer like raw-S** — because the array can only hold one
+  stationary operand (K or V) at a time, so all 8 heads' P gets produced
+  under K-stationary before any of it is consumed under V-stationary. This
+  single hardware fact (one stationary operand at a time) is what forced
+  `steady-state-stream` to bifurcate into `-qk`/`-v` in the first place —
+  the highest-leverage finding of the whole phase.
+- **This surfaced a real, un-clean-slate correction to
+  `prefill_notes.md` §2.3's own scratchpad budget** — that phase assumed a
+  single reused 4,096 B P buffer; the real requirement is ×8 = 32 KB.
+  Checked against the 1 MiB ceiling: still fits (plenty of slack), so
+  `tile_k`=1024 stands, but the original hypothesis's P-sizing was
+  incomplete. Not edited into `prefill_notes.md` itself (a different,
+  completed project's polished deliverable) — recorded in `notes.md` §6.2
+  as where the gap was actually found.
+- **DMA's granularity comes from HBM contiguity, not an analogy to
+  compute's per-head structure.** It was tempting to assume DMA needed the
+  same head-idx treatment as the compute slots by analogy; the real
+  constraint turned out to be Q/O's non-contiguous-across-heads HBM
+  layout, which forced per-head DMA issuance for an entirely different
+  reason (§7.4).
+- **DMA is HBM↔scratchpad only, never accumulator-facing** — matches real
+  Gemmini's own `ex_read_from_acc`/`ex_write_to_spad` vs. `mvin`/`mvout`
+  separation. This forced `softmax-finalize`'s destination to move from
+  accumulator to a dedicated scratchpad region late in the process (§6.5)
+  — worth remembering that a downstream slot's scoping decision reached
+  back and changed an already-"settled" earlier instruction.
 
-**Deliverable**: a real, written instruction-format spec — concrete enough
-that Phase 2 (now split into hand-scheduled *and* automated bundle
-sequences, both required — see `spec.md`, this was updated after Phase 0)
-has something unambiguous to target.
+### Explicitly deferred to Phase 2 kickoff — first things to do in a new session
+
+- **Bit-widths for the hardcoded base addresses themselves** (opcode field
+  width, actual scratchpad/HBM base constants) — the combined pass across
+  all three slots, planned since §5.2, now unblocked since all three slots
+  are fully defined. This was deliberately *not* done yet.
+- **Bundle layout**: fixed-width-per-slot vs. a more compact variable
+  scheme — `spec.md`'s own required "primary hypothesis + explicit
+  alternate" tradeoff (same discipline `prefill_notes.md` §2.1 used for
+  array width). Not started.
+- **`load-stationary` re-issue frequency** — flagged, not blocking, doesn't
+  change any field width, only instruction count in Phase 2's actual
+  bundle sequences.
+- **Then**: Phase 2 itself — hand-scheduled bundle sequence first, then
+  the automated scheduler, both against this same `isa.md` (per `spec.md`,
+  updated after Phase 0 to require both).
 
 ## Files in this repo
 
 - `spec.md` — the project spec (source of truth for phase structure/
   deliverables; has been updated once already, e.g. Phase 2/3 restructured
   to require both a hand-scheduled and an automated bundle sequence)
+- `isa.md` — **the Phase 1 deliverable**: clean, final instruction-format
+  spec, all 8 instructions, no narrative. Start here for Phase 2.
 - `notes.md` — full working log: Phase 0 (reading summaries, Decision 1/2
-  derivations, open threads) + Phase 1 (§5 onward, slot-by-slot ISA design)
+  derivations, open threads) + Phase 1 (§5–§7, slot-by-slot ISA design
+  *including every correction and dead end*, not smoothed over)
 - `handoff.md` — this file
 - `../workload-to-silicon/prefill_notes.md` — the real hardware hypothesis
   this ISA targets (128×128 array, WS dataflow, online-softmax, scratchpad
-  sizing) — sibling repo, not inside this one
+  sizing) — sibling repo, not inside this one. Note: `notes.md` §6.2 found
+  a real gap in this document's own §2.3 P-sizing (not fixed there, see
+  above).
 - `../workload-to-silicon/decode_notes.md` — decode's hardware hypothesis
   (context for Decision 1, and the flagged future second-machine target)
 
