@@ -794,3 +794,125 @@ of *choosing* per-occurrence issuance over the strided-descriptor
 alternate (§7.4) — not an unavoidable fact of HBM non-contiguity by
 itself. The strided-descriptor alternate would have solved the same
 non-contiguity problem without ever exposing head-idx as a field.
+
+---
+
+## 9. Post-completion correction: fine-grained softmax granularity was missing from the loop nest and §8.1's counts
+
+Caught while reconstructing the full loop nest in the Phase 2 session —
+this is a real bug, not staleness, and it reaches further than the
+instruction counts alone.
+
+### 9.1 What went wrong
+
+`load-stationary`'s 5-bit source field (2-bit buffer-select + 3-bit
+slice-idx, §5.2/§7) was **already correctly designed** around the fact
+that a 1024-wide chunk only fits the 128-row array in 8 slices — nothing
+wrong there. But §8.1's instruction-count table (the 144:72:32 ratio used
+to justify fixed-width bundle layout) silently used *coarse* granularity —
+one `steady-state-stream-qk`/`softmax-update` per (chunk, head), as if
+the whole 1024-wide chunk were one compute pass. That directly contradicts
+`prefill_notes.md` §2.3's own explicit, already-settled finding: softmax
+granularity is **fine-grained, per 128-wide array sub-pass** — coarse was
+tried first and rejected because it overflows the accumulator budget by
+2 KB (133,120 B running state + 131,072 B coarse raw-S > 262,144 B).
+`load-stationary`'s field design correctly anticipated this; the loop-nest
+reasoning built on top of it in §8.1 did not.
+
+### 9.2 Corrected loop nest
+
+A slice loop (0..8, matching `tile_k`/128 = 1024/128) sits *inside* chunk
+and *outside* head, for both the K/QK^T half and the V/·V half:
+
+```
+for batch in 0..32:
+  for kv_group in 0..8:
+    for q_tile in 0..256:
+      load-Q ×8 (once per head)                    # DMA
+
+      for chunk in 0..8:                            # tile_k sweep
+        for slice in 0..8:                          # 1024/128 array sub-pass — §2.3's fine-grained softmax
+          load-stationary(K, slice)
+          for head in 0..8:
+            steady-state-stream-qk(head)            # → raw S (fixed accum slot)
+            softmax-update(head)                    # → m, l, O-rescale, P[head] (this slice)
+
+          load-stationary(V, slice)                 # same slice, right after K's — §9.4 decides
+                                                      # this ordering specifically (not chunk-batched)
+          for head in 0..8:
+            steady-state-stream-v(head)              # P[head] × V[slice] → accumulate O[head]
+
+        load-K/V(K, next chunk)                      # DMA prefetch, double-buffered
+        load-K/V(V, next chunk)
+
+      for head in 0..8:
+        softmax-finalize(head)                        # O_final → scratchpad
+
+      store-O ×8 (once per head)                      # DMA
+```
+
+### 9.3 Corrected instruction counts (per Q-tile)
+
+| Slot | Instruction | Old (wrong) count | Corrected count |
+|---|---|---|---|
+| Matmul-issue | `load-stationary` | 16 | 2×8×8 = **128** |
+| Matmul-issue | `steady-state-stream-qk` | 64 | 8×8×8 = **512** |
+| Matmul-issue | `steady-state-stream-v` | 64 | **512** |
+| SFU | `softmax-update` | 64 | **512** |
+| SFU | `softmax-finalize` | 8 | **8** (unaffected — fires once per head, after all chunks/slices) |
+| DMA | all three | 32 | **32** (unaffected — DMA moves whole 1024-wide chunks; array sub-passing is invisible to it) |
+
+New per-slot totals: matmul-issue = 1,152, SFU = 520, DMA = 32. Ratio
+≈ **36:16:1** (was 4.5:2.25:1). **Bundle-layout conclusion (§8.1) is
+unaffected** — the reasoning (storage-not-throughput cost, decode
+simplicity, Groq precedent) was never ratio-dependent, only the magnitude
+of idle-slot waste got more extreme (DMA idle ~97% of cycles under a
+best-case matmul-bound schedule, not ~78%). **Bundle width (32 bits,
+§8.3) is also unaffected** — that's per-instruction field size, not
+instruction count.
+
+### 9.4 The deeper thing this surfaces — and why it had to be settled here, not deferred
+
+Correction 3 (§6.2) concluded P needs ×8 residency because the K→V
+reload boundary was assumed to sit at the **chunk** level. With slicing
+now explicit, that boundary could instead sit at the **slice** level
+(K[slice] → 8 heads → V[slice] → 8 heads → next slice) or the chunk level
+(all 8 K-slices, then all 8 V-slices) — and unlike a pure scheduling
+choice, **this one changes the ISA field count itself**, not just
+scratchpad usage:
+
+- `m`, `l`, `O` are persistent, incrementally-updated state — exactly one
+  instance per head, always, regardless of scheduling. No slice dimension
+  ever applies to them.
+- **P is not persistent** — it's a fresh value produced once per (head,
+  slice). Slice-interleaved: only one slice's 8 P's are ever alive at
+  once, safely reusing the same 8 head-indexed slots every time — 3-bit
+  head-idx stays sufficient. Chunk-batched: all 64 (head, slice)
+  combinations coexist simultaneously, genuinely requiring a 6th field (a
+  3-bit slice-idx alongside head-idx) on `softmax-update`'s P-write and
+  `steady-state-stream-v`'s P-read — and asymmetrically so, since
+  `steady-state-stream-v`'s O-destination would stay head-only while its
+  P-source needed head+slice.
+
+**Decided, not left open**: slice-interleaved. Total reload count is
+identical either way (16 loads/chunk, regardless of K/V ordering), so
+chunk-batched buys nothing — it costs a real field, 8× more P storage
+(256 KB vs 32 KB — still under budget, but not free), and an asymmetric
+instruction, for zero offsetting benefit. This is core ISA content (spec.md's
+own "concrete enough that Phase 2 has something unambiguous to target"
+bar), not a pure scheduling detail safe to defer — a scheduling choice
+that changes field counts has to be settled at the ISA level, not left
+for Phase 2 to discover. **`softmax-update`/`steady-state-stream-v` stay
+exactly as specified — opcode + 3-bit head-idx, no 6th field — and P's
+residency is genuinely settled at ×8, not conditional.**
+
+### 9.5 Nothing else needed to change
+
+No instruction, no field, no bit-width from §5–§8 was wrong — only the
+*issuance counts* built on top of them (§8.1) and the loop-nest
+documentation. `load-stationary`'s slice-idx field, `steady-state-stream-
+qk/v`'s head-idx-only fields, `softmax-update/finalize`'s fields, the
+32-bit bundle width, and the scratchpad/accumulator capacity totals in
+§8.2 (which already used the correct fine-grained per-slice P size,
+4,096 B — that number was never wrong, only the *count* of simultaneous
+instances was left ambiguous) all stand as written.
