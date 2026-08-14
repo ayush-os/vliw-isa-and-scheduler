@@ -651,13 +651,113 @@ independent addresses). Applies identically to `store-O`.
 | `load-K/V` | opcode + 11-bit HBM offset + 2-bit dest-select (K-vs-V + buffer-select) | 1× per chunk |
 | `store-O` | opcode + 3-bit head-idx + 16-bit HBM offset | 8× per Q-tile |
 
-### 7.6 Phase 1 complete — see `isa.md` for the consolidated deliverable
+### 7.6 Phase 1 core ISA complete — the encoding pass (bundle layout + sizing) followed in §8
 
-All three slots (matmul-issue §5–§6.4, SFU §6, DMA §7) are now fully
-field-derived, 8 instruction types total. The clean, non-narrative
-version of this whole spec (without the correction history) is written up
-as `isa.md` — that's the actual Phase 1 deliverable `spec.md` calls for.
-Explicitly deferred to Phase 2 kickoff: bit-widths for the hardcoded base
-addresses/opcode field itself, and the bundle-layout tradeoff
-(fixed-width-per-slot vs. compact variable — `spec.md`'s own "primary
-hypothesis + explicit alternate" requirement, not yet done).
+All three slots (matmul-issue §5–§6.4, SFU §6, DMA §7) are field-derived,
+8 instruction types total. What remained — bundle layout and the combined
+bit-width/sizing pass, both required by `spec.md`'s own encoding-decision
+list — is worked through in §8 below.
+
+---
+
+## 8. Phase 1 — Encoding Pass: Bundle Layout and Sizing
+
+The last two required decisions (`spec.md`: "address-field widths sized
+to real capacity... how the bundle itself is laid out... state and defend
+the tradeoff"), done last since bundle layout gates opcode width and
+opcode width gates the final per-slot sizes.
+
+### 8.1 Bundle layout: fixed-width-per-slot, checked against real numbers first
+
+Initial instinct (user's): pipelining should keep every slot busy most of
+the time, favoring fixed-width. **Checked, not assumed** — real
+issuance counts per Q-tile-iteration (8 chunks × 8 heads):
+
+- Matmul-issue: 16 `load-stationary` (2/chunk × 8) + 64 `steady-state-stream-qk` + 64 `steady-state-stream-v` = **144**
+- SFU: 64 `softmax-update` + 8 `softmax-finalize` = **72**
+- DMA: 8 `load-Q` + 16 `load-K/V` (2/chunk × 8) + 8 `store-O` = **32**
+
+Ratio ≈ 4.5 : 2.25 : 1. Even under a best-case schedule bottlenecked by
+matmul-issue (the busiest slot), SFU is idle ~50% of cycles and DMA
+~78%. **The stated intuition ("always busy") doesn't hold up** — but the
+conclusion (fixed-width) still does, for different reasons:
+
+1. The idle-slot cost is code-density/storage, not throughput — an idle
+   slot doesn't cost a cycle, just unused bits in that cycle's encoding.
+2. Fixed-offset decode is real hardware simplicity, consistent with this
+   project's standing preference for minimal control hardware over
+   marginal efficiency (mirrors the DMA-scoping decision and the
+   base+idx×stride resolution over a strided-DMA engine — both times,
+   "don't add hardware capability you haven't earned" won).
+3. Direct precedent: Groq's own dispatch is "144-wide VLIW instructions"
+   (§1.3) — a fixed format, in a chip whose entire thesis is minimal ICU
+   area, i.e. the real production analog for this project's own bet
+   already made this exact tradeoff the same way.
+
+**Primary hypothesis**: fixed-width-per-slot. **Explicit alternate**: a
+compact/variable scheme (active-slot bitmask + only-present-slots'
+fields) — would recover most of the idle-slot waste at the cost of
+variable-length decode; the real tradeoff to revisit if code density ever
+becomes the actual bottleneck (e.g. Phase 2's fully-unrolled program
+turning out far larger than instruction memory can hold — this project
+has no hardware loop construct at all, per the Note on Scope, so the
+compiled program really is this large, un-shrunk by iteration).
+
+### 8.2 Sizing pass: two more real corrections, same shape as P's
+
+Verifying every region against real capacity (`prefill_notes.md` §2.3's
+budgets) surfaced two more corrections in the same shape as Correction 3
+(§6.2) — an original hypothesis assumed a value smaller/simpler than what
+this session's own derivations actually require.
+
+**§2.3's original scratchpad equation** had `"fixed Q/output (8,192 B)"`
+as one combined term — implying Q and output were each conceived as
+single, ~4,096 B transient buffers, the same (now-known-wrong) shape as
+the original P assumption. But:
+
+- **Q** actually needs ×8 simultaneous per-head residency (§6.2
+  Correction 4, driven by the chunk-outer/head-inner loop order, §5.5) →
+  8 × 4,096 B = **32,768 B**, not ~4,096 B.
+- **Output** actually needs its own ×8 per-head scratchpad region (§6.5's
+  `softmax-finalize` destination correction) → also **32,768 B**, at
+  **int8**, not fp32 — fp32 was only ever needed for softmax's internal
+  numerical stability; once `finalize` does the final divide, nothing
+  downstream needs more precision than the workload's own stated
+  int8-output convention (`prefill_notes.md`'s workload table).
+
+Combined: 65,536 B against the original 8,192 B assumption — an 8×
+gap, same shape as Correction 3, on two regions instead of one.
+
+**Full capacity check** (both fit comfortably — see `isa.md` §5 for the
+final tables):
+- Scratchpad: K/V (524,288 B) + P (32,768 B) + Q (32,768 B) + output
+  (32,768 B) = 622,592 B of 1,048,576 B (slack ≈ 416 KB).
+- Accumulator: metadata+output-accum combined (133,120 B, §2.3's original
+  `8×520×tile_q` term, unaffected by the scratchpad corrections above
+  since that's the *accumulator*-resident copy of `O` during
+  accumulation, separate from the *scratchpad* copy `finalize` writes) +
+  raw-S/P transient (16,384 B) = 149,504 B of 262,144 B (slack ≈ 110 KB).
+
+### 8.3 Final bundle width
+
+Opcode widths, mechanical once bundle layout is fixed:
+`ceil(log2(instruction count))` per slot — matmul-issue (3 types) → 2
+bits, SFU (2 types) → 1 bit, DMA (3 types) → 2 bits.
+
+| Slot | Opcode | Worst-case instruction fields | Slot width |
+|---|---|---|---|
+| Matmul-issue | 2 bits | `load-stationary`, 5-bit src | 7 bits |
+| SFU | 1 bit | either instruction, 3-bit head-idx | 4 bits |
+| DMA | 2 bits | `load-Q`/`store-O`, 16-bit offset + 3-bit head-idx | 21 bits |
+
+**Total: 7 + 4 + 21 = 32 bits.** One clean 32-bit word per cycle.
+
+### 8.4 Phase 1 complete — see `isa.md` for the consolidated deliverable
+
+Every encoding decision `spec.md` requires is now made: all 8
+instructions' fields, bundle layout (stated and defended, primary +
+alternate), full capacity verification, final 32-bit bundle width. The
+clean, non-narrative version of this whole spec is `isa.md` — that's the
+actual Phase 1 deliverable. One item genuinely deferred to Phase 2,
+non-blocking: `load-stationary`'s re-issue frequency (§5.5's open
+thread) — affects instruction count, not any field width.
