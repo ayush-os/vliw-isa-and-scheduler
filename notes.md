@@ -260,3 +260,112 @@ for free.
   no real-silicon measurement to check hand-derived latencies against —
   flag explicitly in Phase 3 rather than silently assuming the hand-derived
   numbers are trustworthy.
+
+---
+
+## 5. Phase 1 — ISA Definition: Matmul-Issue Slot
+
+First of the three Phase 1 slot types (matmul-issue, vector/scalar-unit,
+DMA — `spec.md`'s structure). Mostly user-derived with real-time checking/
+pushback, per the project's stated working style — including one genuine
+dead end that got recognized and abandoned, not forced.
+
+### 5.1 Two instruction types, not one
+
+Grounded in §2.1 (WS dataflow, K/V-stationary) + §2.5 (forced Q-tile-outer
+loop order — within one Q-tile, the stationary K/V chunk in the array gets
+swapped ~8× as the loop sweeps the group's chunks). "Load a new stationary
+operand into the array" and "stream the current Q/P tile through whatever's
+already loaded" are structurally distinct operations — the same split real
+Gemmini makes (`PRELOAD` vs `COMPUTE`), independently re-derived here
+rather than copied from it.
+
+- **load-stationary**: moves a chunk of K or V from scratchpad into the
+  array's stationary registers.
+- **steady-state-stream**: streams the current Q or P tile through the
+  array (whatever's currently loaded as stationary), writing results to
+  the accumulator.
+
+### 5.2 Field list, settled
+
+- **opcode**: which of the two instruction types.
+- **load-stationary**: source scratchpad address (K/V chunk). No length
+  field — the load is always exactly 128 wide, the array's own physical
+  PE-row count, a hardware constant (not a workload/tiling choice), even
+  more rigidly fixed than `tile_q`.
+- **steady-state-stream**: source scratchpad address (Q/P) + destination
+  accumulator address. No length field — always exactly `tile_q`=32 (fixed
+  under the Decision 2 fixed-shape idealization; `seq_len_q`/`tile_q` =
+  8192/32 = 256 divides evenly, no ragged remainder to worry about).
+- **No dataflow-select field**, confirmed still applicable (§4.6, carried
+  over from Phase 0).
+- **No transpose bits** — see §5.3, this took real derivation (and one
+  real dead end) to land on.
+
+Bit-widths for the address fields deliberately **deferred** to a single
+pass across all three Phase 1 slots at the end (matmul-issue + vector/
+scalar + DMA together) rather than picked per-slot, since all three slots'
+addresses draw on the same real scratchpad/accumulator capacity numbers
+(§2.3/§2.4) and picking widths in isolation risked inconsistency.
+
+### 5.3 Transpose-bit derivation (real back-and-forth, real dead end, real resolution)
+
+Grounded in §4.7's real Gemmini finding: one physical array serves both
+QK^T and ·V via a hardware transposer, gated by software-visible flags,
+because a matrix's row-major scratchpad storage doesn't always match the
+order the array wants to consume it in.
+
+- **First conflation, caught and corrected**: the `^T` in "QK^T" (math —
+  which dim contracts) is not the same thing as the hardware transpose bit
+  (data layout vs. array feed order, "independent of programmer intent"
+  per §4.7's own wording) — a matrix can need the hardware transposer for
+  reasons that have nothing to do with whether the math has a `T` in it.
+- **Dead end**: tried to pin the bit count down via the real Chisel
+  equations (`a_transpose`, `bd_transpose` are software-controlled; a
+  third port is hardwired `false` always under WS). This bounds the
+  hardware at ≤2 software-controllable bits total — a fact that *is*
+  provable, no mapping knowledge required — but assigning those bits to
+  our two instructions requires knowing which real Gemmini port (A/B/D)
+  maps to which of our four operands (Q/K/P/V), and that mapping was
+  **never verified** anywhere in this project — `prefill_notes.md` §4.7's
+  own scope caveat and §6's open thread both say this exact question was
+  deliberately left unchecked (would need a real kernel, descoped in
+  Phase 1d). Spent real time circling on this before recognizing it as a
+  dead end rather than a puzzle to push harder on.
+- **Resolution — genuine first principles, independent of the unverified
+  port mapping**: using only two already-established facts (row-major
+  storage, §4.7; the array wants "same-row elements entering the same PE
+  sequentially rather than adjacent PEs simultaneously," §4.7's own
+  phrasing) —
+  - **load-stationary** (K/V): the stationary operand is *by definition*
+    spread spatially across many PEs at once — that's what "stationary"
+    means physically. A row's elements landing in different PEs in the
+    same cycle always mismatches row-major's single-contiguous-stream
+    nature. Transpose is **permanently engaged** — a hardwired fact of
+    this instruction, not a runtime choice.
+  - **steady-state-stream** (Q/P): the moving operand is *by definition*
+    fed into one PE, one element per cycle, over time — exactly what
+    row-major storage naturally provides on readout. Transpose is
+    **permanently disengaged**.
+  - Same shape as the §4.6 dataflow-is-a-compile-time-constant finding:
+    something true 100% of the time doesn't need a software field, it's
+    just hardware behavior.
+- **Final: 0 explicit transpose bits, either instruction.**
+- Visual reference built to nail this down for future recall:
+  [**Fan-Out vs. Funnel**](https://claude.ai/code/artifact/b8690974-a2a6-4616-987a-e581ea3a81dd)
+  — animated diagram, one row-major memory row routed two ways (fan-out to
+  4 PEs in 1 cycle vs. funnel to 1 PE over 4 cycles).
+
+### 5.4 Process note for next session
+
+The "check, don't hand over the derivation" mode (per `handoff.md`) works,
+but watch the calibration: pushing back with more open questions instead
+of stating what's actually known — especially across several turns on the
+same sub-question — reads as cryptic/evasive rather than Socratic, and got
+explicit direct user feedback on this mid-session. When a claim's already
+been checked once and a follow-up is genuinely just asking for the
+concrete mechanism in plain language, give it plainly. When directly asked
+"what do you recommend" or "give me a final decision," give one, directly
+— that's not the same as doing the derivation *for* them unprompted;
+asking for a recommendation on a judgment call is a different request
+than skipping their own derivation entirely.
