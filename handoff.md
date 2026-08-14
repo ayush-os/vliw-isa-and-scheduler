@@ -24,6 +24,18 @@ giver**:
   with Decision 2 in Phase 0, and the derivation surfaced real content
   (the padding/bucketing caveat, the DMA-is-scheduled-not-cache-triggered
   mechanism) that the one-line version missed.
+- **Calibration note from Phase 1's matmul-issue slot work**: "check,
+  don't hand over the derivation" can tip into being cryptic if it's just
+  another open question every time, several turns in a row, on the same
+  sub-point — got direct user feedback on this once already, don't repeat
+  it. If a claim's already been checked once and a follow-up is genuinely
+  asking "what do you actually mean, concretely" — answer that plainly,
+  don't volley another question back. And if I'm directly asked "what do
+  you recommend" or "give me a final decision" on a judgment call under
+  real uncertainty, give one, directly, with reasoning — that's a
+  different request than doing someone's own derivation for them
+  unprompted, and stalling on it with more hedging is its own failure
+  mode, not extra rigor.
 - **Exception, and it's explicit**: if I flag something myself as
   boilerplate, busywork, or "not contributing to my learning" — I'll say
   so directly — just do it or give me the answer. Don't make me ask twice.
@@ -65,30 +77,55 @@ Full reasoning, sources, and three background-reading summaries (Itanium/
 EPIC, TI C6000/Hexagon, Groq's real ISA) plus the Saman Amarasinghe
 "Compiler 2.0" lecture TLDR are all in `notes.md` §1.
 
-## What's next: Phase 1 — ISA definition
+## Phase 1 progress: matmul-issue slot done, vector/scalar-unit slot next
 
-Per `spec.md` Phase 1. Real design work, not boilerplate — three slot
-types for prefill, each grounded in a specific prior finding (don't invent
-from scratch):
+Per `spec.md` Phase 1 — three slot types for prefill, each grounded in a
+specific prior finding, not invented from scratch. Full working log for
+everything below: **`notes.md` §5** — read that before continuing, this
+file is just the pointer + status.
 
-- **Matmul-issue slot** — tile coordinates into the scratchpad, addressing
-  operands. `prefill_notes.md` §4.6 already found WS-only dataflow is a
-  compile-time Chisel constant, not runtime-selected — so this slot
-  shouldn't need a runtime dataflow-select field. Real question to work
-  through: what *does* it need (address fields, tile-coordinate encoding)?
-- **Vector/scalar-unit slot** — the softmax sequence (max/exp/sum/
-  normalize), using the online-softmax algorithm from `prefill_notes.md`
-  §2.3/§4.5 (independently derived, then confirmed against Gemmini's real
-  `Normalizer` module).
-- **DMA slot** — tile load/store, sized against the real `tile_k=1024`/
-  `tile_q=32` scratchpad budget (`prefill_notes.md` §2.3).
+**Matmul-issue slot: done.** Two instruction types (`load-stationary`,
+`steady-state-stream`), grounded in §2.1/§2.5's forced K/V-chunk-swap
+pattern. Settled fields: opcode, source scratchpad address for each
+(+ destination accumulator address for `steady-state-stream`), no length
+fields (both lengths are hardware/workload constants — 128 = array's
+physical PE count, 32 = `tile_q`), no dataflow-select field (§4.6), **and
+a real derived result worth remembering: zero explicit transpose bits in
+either instruction** — both instructions' transpose behavior turned out to
+be a fixed hardware fact (stationary operand always fans out across many
+PEs in one cycle → mismatches row-major storage → transpose permanently
+on; moving operand always funnels into one PE over many cycles → matches
+row-major → transpose permanently off), the same shape as the §4.6
+dataflow-is-a-compile-time-constant finding. Full derivation, including a
+real dead end (tried to resolve it via Gemmini's real A/B/D port
+semantics, which turned out to be genuinely unverifiable from
+`prefill_notes.md`'s own stated scope, §4.7/§6) and the eventual
+first-principles resolution that didn't need that mapping at all: `notes.md`
+§5.3. There's also a visual reference from this derivation — [**Fan-Out vs.
+Funnel**](https://claude.ai/code/artifact/b8690974-a2a6-4616-987a-e581ea3a81dd),
+an animated diagram of the fan-out-vs-funnel mechanism — worth a look if
+picking this back up cold.
 
-Real encoding decisions the spec calls out explicitly, not to skip past:
-address-field widths (sized to the real scratchpad capacity, not
-arbitrary), immediate operand widths, fixed-width-per-slot vs. compact
-variable bundle layout (state + defend the tradeoff, same "primary
-hypothesis + explicit alternate" discipline `prefill_notes.md` §2.1 used
-for array width).
+Bit-widths for matmul-issue's address fields are **deliberately deferred**,
+not forgotten — planned as one pass across all three slots' addressing
+needs together at the end of Phase 1, once vector/scalar and DMA are also
+defined, so widths get chosen consistently against the real scratchpad/
+accumulator capacities rather than piecemeal per slot.
+
+**Next up: vector/scalar-unit slot** — the softmax sequence (max/exp/sum/
+normalize), using the online-softmax algorithm from `prefill_notes.md`
+§2.3/§4.5 (independently derived, then confirmed against Gemmini's real
+`Normalizer` module).
+
+**Then: DMA slot** — tile load/store, sized against the real
+`tile_k=1024`/`tile_q=32` scratchpad budget (`prefill_notes.md` §2.3).
+
+**Then: the deferred encoding pass** — address-field widths (sized to the
+real scratchpad capacity, not arbitrary) and immediate operand widths for
+all three slots together, plus fixed-width-per-slot vs. compact variable
+bundle layout (state + defend the tradeoff, same "primary hypothesis +
+explicit alternate" discipline `prefill_notes.md` §2.1 used for array
+width).
 
 **Deliverable**: a real, written instruction-format spec — concrete enough
 that Phase 2 (now split into hand-scheduled *and* automated bundle
@@ -100,8 +137,8 @@ has something unambiguous to target.
 - `spec.md` — the project spec (source of truth for phase structure/
   deliverables; has been updated once already, e.g. Phase 2/3 restructured
   to require both a hand-scheduled and an automated bundle sequence)
-- `notes.md` — full Phase 0 working log: reading summaries, Decision 1/2
-  derivations, open threads
+- `notes.md` — full working log: Phase 0 (reading summaries, Decision 1/2
+  derivations, open threads) + Phase 1 (§5 onward, slot-by-slot ISA design)
 - `handoff.md` — this file
 - `../workload-to-silicon/prefill_notes.md` — the real hardware hypothesis
   this ISA targets (128×128 array, WS dataflow, online-softmax, scratchpad
