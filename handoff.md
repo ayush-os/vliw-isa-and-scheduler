@@ -364,27 +364,58 @@ this design; Timeloop's 2 GHz run was "int8-pumped," not a free bump) —
 assumed — margins ranging from ~70× (general, §11.6) up to ~23,500 cycles
 absolute (chunk 2's specific case, §11.12).
 
-**Not yet done — pick up here, in order** (`notes.md` §11.12 has the full
-detail):
+**The hand-schedule deliverable is done.** [`bundle-schedule.md`](bundle-schedule.md)
+is the actual bundle table `spec.md` asks for — prologue, slice 0, a
+universal matmul-issue/SFU table (identical for every slice, parameterized
+by `slice_start`) with a per-slice DMA overlay, chunk-boundary DMA, and the
+tail, all with real cycle numbers. **Total Q-tile latency: 179,397
+cycles** — the number Phase 3 will compare the automated scheduler
+against. Full derivation, every correction, in `notes.md` §11.13–§11.16.
 
-1. **Derive the tail**: `softmax-finalize ×8` and `store-O ×8`, after all
-   8 chunks — completely undeveloped so far. Real dependency chain
-   (`finalize(head i)` needs chunk 7's `softmax-update(head i)`;
-   `store-O(head i)` needs `finalize(head i)`) never walked through.
-2. **Transcribe everything into an actual bundle-by-bundle sequence** —
-   everything done so far (items 5–8 above) is start/end-cycle reasoning
-   per instruction, not a literal cycle-by-cycle bundle table. This is
-   the real Phase 2 hand-schedule deliverable `spec.md` asks for.
-3. **Flagged, explicitly open, not next-in-line**: whether the *next*
-   Q-tile's prologue (~160-cycle wait, repeated 65,536× across the
-   outer loops excluded from scope) can overlap with the *current*
-   Q-tile's tail — cross-iteration software pipelining, same technique as
-   Itanium's rotating registers (§1.1). Scoped out of `phase2-loop.md` by
-   design, never actually checked.
-4. **Not started at all**: the automated scheduler — `spec.md`'s second
-   required Phase 2 deliverable (real list-scheduling/software-pipelining,
-   same loop nest and ISA), needed so Phase 3 can compare the two
-   schedules honestly.
+**One real modeling gap caught and fixed along the way, worth knowing
+about since it touches every cycle number in this project**: the
+`.844`/`.995`-style fractional DMA cycle counts used throughout
+§11.11/§11.12 (an earlier session) weren't physically valid — one bundle
+issues per clock, so a slot can't hand off mid-cycle. **Fix: ceiling each
+DMA instruction's own latency independently** — `load-K/V`=160,
+`load-Q`/`store-O`=5, not the raw `159.844`/`4.995` (`notes.md` §11.4).
+Every cycle number in `bundle-schedule.md` uses the corrected values;
+anything computed before this fix (including earlier revisions of this
+file) is stale. Structural findings (DMA ordering, margin sizes,
+hazard-free conclusions) were never affected by this, only the exact
+numbers.
+
+**Roadmap for the rest of Phase 2 — evaluated on learning-value-to-time,
+not just followed from `spec.md`'s checklist** (`notes.md` §11.17 has the
+full reasoning):
+
+1. **Cross-iteration software pipelining: evaluated and deliberately
+   dropped, not just deferred.** The savings are the ~160-cycle prologue
+   wait × 65,536 Q-tiles ≈ 10.5M cycles, against a total workload of
+   65,536 × 179,397 ≈ 11.76 billion cycles — **≈0.09% of total runtime**.
+   The technique (Itanium-style rotating-register pipelining) is already
+   the project's conceptual reference point from Phase 0's reading;
+   actually implementing it here would mean redoing Phase 2's whole
+   hazard-then-schedule methodology at the outer-loop level for a
+   fraction-of-a-percent win. Bad time-to-learning ratio — not picking
+   this up unless something changes that math.
+2. **Automated scheduler: the one real remaining item, scoped down.**
+   Worth doing — it's the only way to actually test the hand-schedule's
+   unverified "no avoidable stalls found ≠ optimal" caveat (§11.12) rather
+   than asserting it, and it's the direct payoff of the project's own
+   Phase 0 motivating question (does static scheduling match hand-tuning,
+   Itanium's real historical problem). **But scoped to what the
+   comparison actually needs, not full CS243 generality**: this problem
+   is one basic block, 3 fixed-occupancy resource slots, no control flow,
+   no register allocation — a greedy list-scheduler over the same
+   dependency graph already derived in §11.8 (S double-buffer, P/O
+   ordering, metadata recurrence) is enough. Prediction worth stating
+   before building it, so it's checkable afterward: given how
+   constraint-bound the hand schedule already was (matmul-issue is the
+   real bottleneck almost everywhere; SFU/DMA idle because there's
+   genuinely nothing for them to do, not from scheduling slack), expect
+   the automated result to land very close to 179,397 cycles — itself the
+   interesting finding if true.
 
 **One framing to hold onto**: don't call the current derivation
 "optimized." "No avoidable stalls found" is the honest, weaker claim —
@@ -406,12 +437,21 @@ alternative orderings were tried and compared.
   derivations, open threads) + Phase 1 (§5–§9, slot-by-slot ISA design
   *including every correction and dead end*, not smoothed over) + §10
   (a standalone cross-project GQA-reuse finding, unrelated to Phase 2) +
-  §11 (Phase 2 hand-scheduling — §11.1–§11.7 latency/clock groundwork,
-  §11.8–§11.12 hazard fixes + prologue/epilogue + slice-0/chunk-boundary
-  derivation, in progress, real pickup point is §11.12's "Next")
+  §11 (Phase 2 — §11.1–§11.7 latency/clock groundwork, §11.8–§11.12 hazard
+  fixes + prologue/epilogue + slice-0/chunk-boundary derivation,
+  §11.13–§11.16 the bundle-table transcription with the ceiling-latency
+  correction, §11.17 the evaluated roadmap decision for the rest of Phase
+  2 — real pickup point is §11.17's "Next": the automated scheduler)
 - `phase2-loop.md` — the Phase 2 loop nest actually being hand-scheduled
   (one Q-tile's steady-state body), kept separate from `notes.md` so it's
   easy to reference by line number
+- `bundle-schedule.md` — **the complete hand-scheduled bundle sequence**,
+  `spec.md`'s literal Phase 2 deliverable, done: merged matmul-issue/SFU/
+  DMA table, one row per issue event, all five segments (prologue, slice
+  0, universal matmul-issue/SFU table + per-slice DMA overlay,
+  chunk-boundary DMA, tail). **Total Q-tile latency: 179,397 cycles.**
+  Clean deliverable only — derivation and format decisions are in
+  `notes.md` §11.13–§11.16.
 - `handoff.md` — this file
 - `../workload-to-silicon/prefill_notes.md` — the real hardware hypothesis
   this ISA targets (128×128 array, WS dataflow, online-softmax, scratchpad
