@@ -1897,3 +1897,107 @@ model would be wasted work if the model changes.
 idea and the systolic-pipelining occupancy question) and decide whether
 either is worth adopting before building the automated scheduler.
 
+### 11.19 DECISION: adopt the corrected occupancy model — fix this before building the automated scheduler
+
+Investigated both findings from §11.18 directly. Result: **the big
+finding is confirmed, not just plausible; the small one is real
+precedent but unconfirmed by this project's own evidence; and they are
+not independent knobs.** Decision made: fix the occupancy model and
+re-derive the hand schedule *before* touching the automated scheduler —
+building the scheduler against a known-wrong occupancy model would be
+wasted work.
+
+**Why the big finding (occupancy = feed-rate, not full latency) counts as
+confirmed, not just argued:** `prefill_notes.md` §3.1 already modeled
+this *exact* hardware (single 128×128 array, 1 GHz) in Timeloop back in
+Phase 1c, independently of this session, and found QK^T achieves **100%
+utilization** — reported cycle count for the full kernel is exactly
+2³⁰ = 1,073,741,824. Cross-check: the audit's from-scratch MAC-bound floor
+(32,768 cycles/Q-tile for both matmuls combined) ÷ 2 (QK^T's even share
+of FLOPs) × 65,536 Q-tiles = 1,073,741,824 — an *exact* match, not
+approximate. Three independent sources (Timeloop's real simulation, the
+audit's own derivation, this cross-multiplication) agree exactly. This
+also directly falsifies §11.8's "physically forced... same physical PEs"
+reasoning: if a stream genuinely had to fully drain (159 cycles) before
+the next could start, 100% utilization would be mathematically
+impossible — the ceiling would be `N/(N+D-1)` = 32/159 ≈ 20%, suspiciously
+close to this schedule's actual 18.3%.
+
+**Applies symmetrically to `steady-state-stream-v`, and the evidence is
+actually cleaner there.** Same mechanism: `notes.md` §11.4 already derived
+`-v`'s 159 cycles "by symmetry" with `-qk`, and within a slice's V-phase
+all 8 heads stream against the same stationary V (`load-stationary(V,
+slice)` loads once, reused by all 8 `steady-state-stream-v` calls) —
+identical structure to K-phase. Checked `prefill_notes.md` §3.1's `·V`
+numbers specifically (not just assumed by analogy): the reported "100%"
+row used output-stationary dataflow, not the weight/V-stationary dataflow
+this ISA actually implements, so that specific number isn't a clean
+match — but the *matching*-dataflow row (`primary_v_v2`, weight-stationary,
+"matches the Phase 1b hypothesis") only reported 80.63%, and the write-up
+explicitly flags that as a local optimum, not the ceiling: the killed
+`_v3` deeper-search run "already showed multiple 100%-utilization samples
+under v2's architecture" — under that same matching dataflow. So 100%
+utilization was directly observed under our actual dataflow for `·V`, not
+just inferred by symmetry with QK^T's own (dataflow-mismatched) citation.
+
+**Why the small finding (`load-stationary` shadow register) is treated
+with more caution:** checked whether this project's own Gemmini RTL work
+(`prefill_notes.md` §4, Phase 1d) already confirms real Gemmini hardware
+lets `PRELOAD` overlap a prior `COMPUTE` — it doesn't. §5.1's existing
+citation of Gemmini's `PRELOAD`/`COMPUTE` split is only about instruction
+*taxonomy* (two separate ops exist, mirrored by our `load-stationary`/
+`steady-state-stream` split), not about whether the real hardware
+double-buffers weights to let them overlap. Real precedent for the
+pattern exists in accelerator design generally, but it's not independently
+validated by anything already in this project the way the big finding is.
+
+**Important correction to how the audit framed its own headline number**:
+"~33,000 cycles, 5.47×" is not attainable from fixing stream occupancy
+alone — the audit's own 512-cycle/slice derivation already assumes
+`load-stationary` is hidden (i.e., already assumes the small finding is
+also adopted). Disentangled:
+- Stream-occupancy fix alone (`load-stationary` still fully serialized):
+  ≈49,000 cycles (≈3.6× over 179,397).
+  small finding alone (old 159-cycle stream occupancy, `load-stationary`
+  hidden): 163,141 cycles (the already-quoted 9.06%).
+- Both together: ≈32,768 + prologue/tail overhead ≈ 33,000 cycles (5.47×).
+
+**Blast radius, scoped before committing — smaller than "redo Phase 1 and
+2," worth being precise about**: this is fundamentally an
+occupancy-*model* correction, not an ISA redesign. Expected to touch:
+the latency/occupancy table (§11.4); all of `bundle-schedule.md`'s cycle
+numbers (same format/methodology, genuinely different numbers — a
+recompute, not a redesign); S's buffer depth in `isa.md`'s capacity table
+(§11.8 found double-buffering gives zero margin under the corrected
+model — audit suggested ×4 may be needed, needs its own real hazard
+re-derivation, not just asserted). Expected **not** to touch: the ISA's
+instruction set, field definitions, or bundle width (33 bits) — those
+were sized by data/state requirements, never by this timing assumption;
+DMA's numbers and hazards (untouched by this, since DMA was never subject
+to the drain-vs-feed conflation — it's not a systolic pipeline); the
+overall Phase 1 capacity/sizing pass beyond S's own entry.
+
+**`bundle-schedule.md` (179,397 cycles) is now superseded, not deleted** —
+banner added at the top of that file. It remains a fully correct answer
+*to the wrong occupancy model*; useful as a reference for the
+before/after comparison Phase 3 will want, not as the current answer.
+
+**Next, in order — this is the real pickup point for a fresh session:**
+1. Re-derive the occupancy model itself: confirm the corrected
+   32-cycle/stream occupancy rule precisely (including whether
+   `load-stationary`'s 128 cycles are genuinely all "feed," already
+   checked informally in this session — every cycle feeds a distinct new
+   row, unlike a stream's drain tail, so no analogous conflation there),
+   and settle the `load-stationary` shadow-register question on its own
+   merits (real hazard/mechanism check, not just precedent) since it's a
+   precondition for the full 5.47× figure.
+2. Full hazard re-pass under the corrected model — §11.8's hazards don't
+   just get tighter margins, at least one (S double-buffering) goes to
+   *zero* margin and may need to change (×2→×4 or similar); P/O margins
+   shrink from ~1,400 to ~380 cycles per the audit's estimate, needs its
+   own real check, not just the audit's number taken on faith.
+3. Re-derive `bundle-schedule.md` from scratch under the corrected model
+   — same five-segment structure/format already built, new numbers.
+4. *Then* build the automated scheduler (§11.17's scoping still applies),
+   now against the corrected occupancy model so the comparison is
+   meaningful.
