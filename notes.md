@@ -964,3 +964,223 @@ ISA — landing on the identical conclusion is the same kind of
 cross-validation this whole project has valued throughout (direct
 precedent: the online-softmax mechanism, independently derived, then
 confirmed against Gemmini's real `Normalizer`, `prefill_notes.md` §4.5).
+
+---
+
+## 11. Phase 2 — Hand-Scheduling: Loop Nest, Latency Derivation, Clock Decision (IN PROGRESS)
+
+Working log for the actual hand-scheduling session — real derivation, real
+self-corrections, kept live rather than smoothed over, same standard as
+§5–§9.
+
+### 11.1 Scope
+
+Per `spec.md` Phase 2's "hand-schedule the real bundle sequence... the same
+way a human would if handed this ISA with no compiler at all" — scoped to
+**one Q-tile's steady-state body**, written out in
+[`phase2-loop.md`](phase2-loop.md) (line numbers there are the reference
+for the rest of this section). The outer `batch`/`kv_group`/`q_tile` loops
+are identical repeats of this same body at different addresses — not new
+scheduling content, so excluded from the file on purpose.
+
+### 11.2 Real gap found: no prologue/epilogue for the double-buffered K/V DMA
+
+`phase2-loop.md` lines 21–22 (`load-K/V(K, next chunk)` /
+`load-K/V(V, next chunk)`) only prefetch the chunk *after* the one
+currently being computed on. Nothing in the body loads chunk 0's own K/V
+data before the `chunk=0` slice loop tries to consume it, and on
+`chunk=7` (the last chunk) that same trailing prefetch would target a
+nonexistent chunk 8. Same shape as Itanium's rotating-register
+prologue/kernel/epilogue for software-pipelined loops (§1.1) — a real
+structural gap, **not yet resolved**, carried forward as the first open
+item for the next session.
+
+One real clarification already made about *how* to resolve it (not yet
+executed): a proposed `if chunk == 0` framing was checked and corrected —
+`chunk` is compile-time-known (Decision 2 check 1) and this ISA has zero
+branch instructions (Note on Scope), so this can't be a runtime
+conditional. The right shape is a literal prologue block, physically
+placed once before the loop in the fully-unrolled compile-time program
+(same as Itanium's rotating-register prologue) — never emitted for
+`chunk`=1–7, not a hardware test emitted every iteration.
+
+### 11.3 DMA latency: bytes → time → cycles
+
+Method (checked, not assumed): bytes moved ÷ HBM bandwidth → real time →
+× clock frequency → cycles. HBM bandwidth reused from real precedent
+already in this project — `prefill_notes.md` §1.3's `8.2×10¹¹ B/s` (TPU
+v5e), the same number Phase 1c's own Timeloop config used for DRAM
+bandwidth (§3 there) — not a fresh assumption.
+
+Byte counts per instruction (int8, per the workload table,
+`prefill_notes.md` §0):
+- `load-K/V`: `tile_k × d_head` = 1024×128 = **131,072 B**
+- `load-Q` / `store-O`: `tile_q × d_head` = 32×128 = **4,096 B**
+
+Raw times: `load-K/V` ≈ **159.844 ns**; `load-Q`/`store-O` ≈ **4.995 ns**.
+Cycle count depends on clock (deferred until §11.5, once compute-cycle
+numbers existed to check against).
+
+### 11.4 Compute latency: matmul-issue and SFU — real mechanisms, not just numbers
+
+**`load-stationary` = 128 cycles.** Real derivation, with one real dead
+end: an initial description ("shifts one cycle at a time down thru the
+array") sounded like a value broadcasting/replicating into every row of a
+column, which would be wrong — `load-stationary` needs 128 *distinct*
+K-position vectors, one per row, not one vector replicated across rows.
+Resolved by tracing a concrete 3×3 example by hand (same
+build-a-small-example technique that resolved Phase 1's transpose-bit
+dead end, §5.3): feed a new row in at the entry column each cycle, shift
+everything already in the array over by one column to make room. Traced
+cycle-by-cycle for 3 rows → 3 cycles, confirming the general case is
+exactly `N` cycles (not `2N-1`) because the shift-out-of-the-way happens
+*concurrently* with each new row's feed, not as a separate phase
+afterward. Generalizes directly: 128×128 case → **128 cycles**.
+
+**`steady-state-stream-qk` = 159 cycles** (and `steady-state-stream-v` =
+159 by symmetry, not separately re-traced). Standard systolic pipeline
+formula `N + D − 1`: `N`=32 (`tile_q`, the feed count — one new Q-position
+starts streaming per cycle) + `D`=128 (`d_head`, the drain — cycles for
+the *last*-fed Q-position's data to finish propagating across the array's
+spatial depth before its output is valid) − 1 (the feed/drain boundary
+cycle is shared, not double-counted) = **159**. Grounded in
+`prefill_notes.md` §2.1's own spatial/temporal split (`QK^T` spatial =
+`(d_head, k-tile)`, temporal = `seq_len_q`; `·V` spatial = `(k-tile,
+d_head)`, temporal = same — identical shape, hence the symmetry claim for
+`-v` without re-deriving). One real correction mid-derivation: an initial
+`128 + 32` guess had the feed/drain labels swapped (called `tile_q`=32 the
+"drain") and was off by one (no `−1`) — both caught before finalizing.
+
+**`softmax-update` ≈ `softmax-finalize` ≈ 32 cycles — a genuinely
+different kind of estimate than the two above, flagged as such.** Unlike
+DMA (real bandwidth number) and the array (real 128×128 structural fact),
+the SFU has **no real anchor** — `prefill_notes.md` §4.5's `Normalizer`
+finding confirms *what* it computes, never *how wide* it is. Adopted as an
+explicit hypothesis, same "primary + alternate" discipline as elsewhere
+(§2.1, §8.1): **primary = 128-wide** (matches the array's own width, so
+the SFU doesn't become an obvious new bottleneck on its producer);
+**alternate = narrower**, grounded in the one real lane-count this project
+actually has on record — `decode_notes.md`'s 32-lane SIMD engine (a
+*different* machine, cross-machine analogy only, not directly
+transferable). Under the primary hypothesis: `softmax-update` processes
+`tile_q`=32 rows (128 elements/row, one row/cycle) → 32 cycles.
+`softmax-finalize` is the same shape (`O` is `tile_q×d_head` = 32×128,
+`l`'s per-row scalar broadcast across each row) → 32 cycles.
+
+Real dependency-chain check done before accepting "32 cycles, one row per
+cycle" as sufficient: does `m_j → P_j → l_j → O_j` force separate
+full passes over all 32 rows (max first, then exp/sum), the way a
+numerically-stable softmax normally needs two passes over an *entire* row
+before any output is valid? Checked explicitly — **no**, because every
+term in the recurrence is scoped to one query row at a time (row `i`'s
+values depend only on row `i`'s own 128 `S_j` elements and row `i`'s own
+prior state, never on other rows), and under the 128-wide hypothesis all
+128 elements of one row arrive together in that row's own cycle — so
+`rowmax`, `exp`, `rowsum`, and the `O` rescale can all resolve within that
+row's processing without re-streaming the other 31 rows. **What is
+*not* resolved**, explicitly flagged as a stated limitation rather than
+chased further: the *internal* pipeline depth within one row's processing
+(a max-reduction tree, an exp unit, a sum-reduction tree all have real
+latency) isn't modeled — decided not worth deriving because (a) there's no
+real hardware anchor for it either, same problem as the width question,
+and (b) the SFU already has large idle slack (~55% under a matmul-bound
+schedule, per the corrected §9.3 ratio) so it's unlikely to actually be
+load-bearing; revisit only if a real schedule turns out SFU-bound.
+
+**Final latency table:**
+
+| Instruction | Cycles |
+|---|---|
+| `load-stationary` | 128 |
+| `steady-state-stream-qk` / `-v` | 159 |
+| `softmax-update` / `softmax-finalize` | 32 |
+| `load-K/V` | 159.844 (raw, pre-clock) |
+| `load-Q` / `store-O` | 4.995 (raw, pre-clock) |
+
+### 11.5 Clock decision: 1 GHz
+
+Real mechanism established before picking: matmul-array cycle counts are
+**clock-invariant** (structural — confirmed directly via Timeloop's own
+identical QK^T cycle count across its 1 GHz and 2 GHz runs, §3.1), but
+DMA's *cycle* cost scales linearly with clock since its real-world time is
+fixed by bandwidth, not cycles/s — `load-K/V` is 159.844 cycles @ 1 GHz vs.
+319.688 @ 2 GHz for the identical real transfer.
+
+This is a real, already-documented risk, not hypothetical:
+`prefill_notes.md` §3.2 finding 2 shows the *identical* schedule
+(`primary_v`/`primary_v_v2`) going from 100% utilization at 1 GHz to
+80.63% at 2 GHz, purely from the clock doubling while DRAM bandwidth
+stayed fixed in bytes/s — direct evidence clock choice can flip whether
+DMA hides behind compute.
+
+**Decided: 1 GHz**, on two grounds, not an arbitrary pick:
+1. **No synthesis pass was ever run** for this design (`prefill_notes.md`
+   §4.6 — Phase 1d explicitly "stopped at RTL/Verilator, before any
+   synthesis pass"), so there's no evidence for what frequency this custom
+   128×128 array + SFU could actually achieve. Reaching for "higher clock,
+   more perf" (raised and rejected mid-session) has nothing backing it.
+2. Timeloop's own 2 GHz run wasn't a free clock bump either — §3.1 labels
+   it "int8-pumped," a specific real hardware technique (double-pumping an
+   int8 datapath), not an arbitrary frequency choice. 1 GHz is Timeloop's
+   own *unmodified* baseline — the only clock value with actual precedent
+   behind it.
+
+### 11.6 DMA-hiding check: real numbers, one real correction
+
+Checked whether `load-K/V(next chunk)`'s DMA cost can be hidden behind the
+current chunk's compute, now that real cycle numbers exist for both sides.
+
+Per-slice matmul-issue cost: `load-stationary(K)`=128 + 8×
+`steady-state-stream-qk`=1,272 + `load-stationary(V)`=128 + 8×
+`steady-state-stream-v`=1,272 = **2,800 cycles/slice**. A chunk has 8
+slices → **22,400 matmul-issue cycles/chunk** available before the next
+chunk's `load-stationary` needs the prefetched data.
+
+Against that, worst-case DMA cost (`load-K/V(K)` + `load-K/V(V)`,
+serialized, no overlap) ≈ `2×159.844 ≈ 320 cycles` @ 1 GHz. Margin ≈ **70×**
+— trivially hideable. (`load-Q`/`store-O` correctly excluded from this
+check — they're once-per-Q-tile, not once-per-chunk, irrelevant to the
+per-chunk prefetch question.)
+
+**One real correction along the way**: an initial pass estimated the
+hiding window as "~1,000+ cycles," counting only one slice's inner 8-head
+loop (8×159≈1,272) rather than the full chunk's 8 slices (22,400) — a
+~22× undercount, caught by actually computing the real number rather than
+eyeballing it. Same shape as §8.1's original ratio miscount (the "always
+busy" intuition that didn't hold up until checked) — this project keeps
+re-learning the same lesson at different levels, worth remembering rather
+than assuming a real number "obviously" holds without computing it.
+
+**Side effect worth keeping**: this margin is large enough (~70× at 1 GHz,
+~35× at 2 GHz) that the clock choice from §11.5 turns out **not to bind**
+on this specific hiding question either way — the §3.2 risk is real *in
+general*, it just doesn't apply to this loop nest's specific DMA:compute
+ratio, which is far more lopsided than the Timeloop `·V` case that
+surfaced it. Both facts stand together, not in tension: clock choice
+matters in general, and 1 GHz was still picked on independent grounds
+(§11.5), not because 2 GHz would have broken this check.
+
+### 11.7 Where this session stopped — pick up here
+
+Latency derivation and the clock decision are both done (§11.3–§11.6).
+**Not yet done, in order**:
+
+1. **Resolve the §11.2 prologue/epilogue structurally** — decide the
+   actual instructions for chunk 0's initial K/V load and chunk 7's
+   missing trailing prefetch, as a literal one-time block in the
+   unrolled program (not a runtime branch, see §11.2).
+2. **Build general producer/consumer placement rules** — for every
+   dependency edge in the loop nest, the minimum cycle gap is the
+   producer's latency (§11.4 table); the open question is what fills that
+   gap (other independent instructions, ideally, not NOPs) in each case.
+3. **First concrete case, in progress when the session ended**:
+   `load-stationary(K, slice)` → `steady-state-stream-qk(head=0)` — the
+   very first instruction of a slice, so unlike later heads/slices (which
+   have prior heads' or prior slices' independent work available to fill
+   the gap), nothing had yet been identified to fill `load-stationary`'s
+   128-cycle latency before `head=0`'s stream instruction can safely
+   issue. This is the exact point to resume at.
+4. Once placement rules exist generally, build the actual bundle
+   sequence — start with one (chunk, slice) sub-iteration as the
+   representative unit, verify it, then generalize across the full loop
+   nest with the prologue/epilogue folded in.

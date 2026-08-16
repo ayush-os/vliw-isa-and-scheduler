@@ -1,7 +1,8 @@
 # Handoff — start here in a new chat
 
 This project is a **pedagogical exercise**, not a "get it built" task. Read
-this whole file before doing anything else, then pick up at Phase 1.
+this whole file before doing anything else, then pick up at **Phase 2**
+(§ below) — Phase 0 and Phase 1 are complete.
 
 ## How to work with me on this project
 
@@ -42,6 +43,15 @@ giver**:
   Research/reading tasks (like Phase 0's background reading) are also fair
   game to just execute fully, since the "learning" there is in absorbing
   the material, not in me re-deriving facts you can look up.
+- **Working technique confirmed in Phase 2, worth defaulting to**: when a
+  hardware-mechanism claim doesn't obviously resolve from description
+  alone (e.g. "does loading a stationary chunk take N or 2N-1 cycles"),
+  building a small concrete numeric example and tracing it by hand
+  cycle-by-cycle settles it fast and catches real mistakes (a broadcast-
+  vs-distinct-row mix-up in `load-stationary`'s mechanism). Same shape as
+  Phase 1's "Fan-Out vs. Funnel" visual for the transpose-bit dead end
+  (`notes.md` §5.3) — reach for a small worked example before a longer
+  abstract argument when a mechanism claim feels unsettled.
 
 ## Project status
 
@@ -213,6 +223,82 @@ and `notes.md` §9 are the current, correct state — anything computed
 before this correction (including earlier in this file, if you're reading
 an old version) is superseded.
 
+## Phase 2: IN PROGRESS — latency derivation + clock decision done, bundle placement started
+
+Per `spec.md` Phase 2: hand-schedule the real bundle sequence first
+(before the automated scheduler). **Full working log:
+`notes.md` §11** — read that before continuing, this section is just a
+pointer + exact pickup point.
+
+**Scope**: one Q-tile's steady-state body, written out in
+[`phase2-loop.md`](phase2-loop.md) — the outer `batch`/`kv_group`/`q_tile`
+loops are identical repeats at different addresses, not new scheduling
+content, so they're intentionally excluded from that file.
+
+**Done:**
+
+- **Real gap found, not yet resolved**: `phase2-loop.md` has no prologue
+  for chunk 0's initial K/V load (the shown DMA only prefetches the
+  *next* chunk) and no guard against chunk 7's trailing prefetch
+  targeting a nonexistent chunk 8 — same shape as Itanium's rotating-
+  register software-pipelining prologue/epilogue. Confirmed this must be
+  a literal one-time block in the compile-time-unrolled program, **not**
+  a runtime conditional (this ISA has zero branch instructions, and
+  Decision 2 already established zero data-dependent branching) —
+  `notes.md` §11.2.
+- **Full latency table derived**, each with a real mechanism behind it,
+  not just a number — `notes.md` §11.4:
+
+  | Instruction | Cycles |
+  |---|---|
+  | `load-stationary` | 128 |
+  | `steady-state-stream-qk` / `-v` | 159 |
+  | `softmax-update` / `softmax-finalize` | 32 (SFU width is a stated hypothesis, no real hardware anchor — see below) |
+  | `load-K/V` | 159.844 (cycles = ns at 1 GHz, so this doubles as the raw time) |
+  | `load-Q` / `store-O` | 4.995 (same — cycles = ns at 1 GHz) |
+
+  The SFU numbers rest on a real, explicit hypothesis (128-wide, matching
+  the array) with no hardware precedent behind it the way DMA (real
+  bandwidth) and the array (real 128×128 structural fact) have — and a
+  stated, not-chased limitation: internal per-row pipeline depth
+  (max-reduction, exp, sum-reduction) isn't modeled. Worth revisiting only
+  if a real schedule turns out SFU-bound (unlikely — SFU has ~55% idle
+  slack per the corrected §9.3 ratio).
+- **Clock decided: 1 GHz** — not arbitrary. Grounded in two things: no
+  synthesis pass was ever run for this design (`prefill_notes.md` §4.6),
+  so there's no evidence for what frequency it could actually achieve;
+  and Timeloop's own 2 GHz run was explicitly "int8-pumped" (a specific
+  real technique), not a free clock bump, making 1 GHz — Timeloop's own
+  *unmodified* baseline — the only value with real precedent. `notes.md`
+  §11.5 also has the real, already-documented risk this checked against
+  (`prefill_notes.md` §3.2: identical schedule, 100%→80.63% utilization
+  going 1→2 GHz) before concluding it doesn't actually bind here.
+- **DMA-hiding checked with real numbers, not assumed**: one chunk has
+  22,400 cycles of matmul-issue work (8 slices × 2,800 cycles/slice)
+  against ~320 cycles of worst-case `load-K/V` DMA — ~70× margin, trivially
+  hideable. An initial pass undercounted this by ~22× (only counted one
+  slice's inner loop, not the full chunk) — caught by computing the real
+  number rather than eyeballing it, `notes.md` §11.6.
+
+**Not yet done — pick up here, in order** (`notes.md` §11.7 has the full
+detail):
+
+1. Resolve the prologue/epilogue from above as actual instructions.
+2. Build general producer/consumer placement rules — for each dependency
+   edge, the minimum cycle gap is the producer's latency; the open
+   question each time is what fills that gap (other independent work,
+   ideally, not NOPs).
+3. **Exact point the session ended on**: `load-stationary(K, slice)` →
+   `steady-state-stream-qk(head=0)` — the first instruction of a slice,
+   so unlike later heads (which have prior heads'/slices' independent
+   work available), nothing had been identified yet to fill
+   `load-stationary`'s 128-cycle latency before `head=0` can issue. Start
+   here.
+4. Once placement rules exist generally, build the actual bundle
+   sequence — one (chunk, slice) sub-iteration first, verify it, then
+   generalize across the full loop nest with the prologue/epilogue folded
+   in.
+
 ## Files in this repo
 
 - `spec.md` — the project spec (source of truth for phase structure/
@@ -221,8 +307,14 @@ an old version) is superseded.
 - `isa.md` — **the Phase 1 deliverable**: clean, final instruction-format
   spec, all 8 instructions, no narrative. Start here for Phase 2.
 - `notes.md` — full working log: Phase 0 (reading summaries, Decision 1/2
-  derivations, open threads) + Phase 1 (§5–§7, slot-by-slot ISA design
-  *including every correction and dead end*, not smoothed over)
+  derivations, open threads) + Phase 1 (§5–§9, slot-by-slot ISA design
+  *including every correction and dead end*, not smoothed over) + §10
+  (a standalone cross-project GQA-reuse finding, unrelated to Phase 2) +
+  §11 (Phase 2 hand-scheduling: loop nest, latency derivation, clock
+  decision, in progress)
+- `phase2-loop.md` — the Phase 2 loop nest actually being hand-scheduled
+  (one Q-tile's steady-state body), kept separate from `notes.md` so it's
+  easy to reference by line number
 - `handoff.md` — this file
 - `../workload-to-silicon/prefill_notes.md` — the real hardware hypothesis
   this ISA targets (128×128 array, WS dataflow, online-softmax, scratchpad
