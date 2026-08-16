@@ -12,7 +12,7 @@ group size = 8), `d_head`=128, array=128×128, `tile_q`=32, `tile_k`=1024
 (8 K/V chunks per sweep, 256 Q-tiles per sequence).
 
 **Three bundle slots**, each mapping to one heterogeneous unit
-(Decision 1): matmul-issue, vector/scalar-unit (SFU), DMA. 8 instruction
+(Decision 1): matmul-issue, vector/scalar-unit (SFU), DMA. 9 instruction
 types total. No dynamic/OOO behavior anywhere (Note on Scope) — every
 field below is either a hardware/workload constant (zero bits) or a
 value the compiler computes and embeds at compile time (a real field,
@@ -47,7 +47,7 @@ softmax granularity) for one head — issued once per (chunk, slice, head).
 | Field | Width | Meaning |
 |---|---|---|
 | opcode | — | `steady-state-stream-qk` |
-| head-idx | 3 bits | Addresses the Q source (fixed Q-region-base + idx). Destination (raw S) is a single fixed accumulator location — zero bits, since `softmax-update` consumes it immediately, same head, no reload gap in between. |
+| head-idx | 3 bits | Addresses the Q source (fixed Q-region-base + idx). Destination (raw S) is one of two double-buffered accumulator locations, selected by head-idx's low bit (`head_idx & 1`) — zero new bits, since head-idx is already carried for Q addressing. Double-buffered (not single) because `softmax-update(head i)` must finish reading S before `steady-state-stream-qk(head i+1)` can safely overwrite it — a single shared location would force a stall every head transition (`notes.md` §11.8). |
 
 - No length field — always `tile_q`=32.
 - No dataflow-select field.
@@ -69,7 +69,7 @@ accumulating into the output. Same per-(chunk, slice, head) granularity as
 
 ---
 
-## 2. Vector/scalar-unit (SFU) slot (2 instructions)
+## 2. Vector/scalar-unit (SFU) slot (3 instructions)
 
 Grounded in the actual online-softmax recurrence, per head, over K/V
 chunks `j=1..8` within one Q-tile (`m_0=-inf, l_0=0, O_0=0`; `S_j` produced
@@ -102,7 +102,7 @@ contribution for one head, matching `steady-state-stream-qk`'s granularity
 | opcode | — | `softmax-update` |
 | head-idx | 3 bits | Resolves metadata (`m`,`l`), output (`O`), and P against three different hardcoded bases. |
 
-- **Reads**: S (fixed accumulator location, zero bits, read-only — never written by this instruction), metadata (head-idx), output `O` (head-idx).
+- **Reads**: S (one of two double-buffered accumulator locations, selected by head-idx's low bit — zero new bits, read-only — never written by this instruction), metadata (head-idx), output `O` (head-idx).
 - **Writes**: metadata (head-idx), output `O` (head-idx — rescale written in place), P (scratchpad, head-idx).
 - `m`/`l`/`O` are persistent, incrementally-updated state — exactly one
   instance per head regardless of scheduling. **P is not** — it's a fresh
@@ -119,6 +119,21 @@ contribution for one head, matching `steady-state-stream-qk`'s granularity
 
 - **Reads**: `l` and `O`, both accumulator, head-idx.
 - **Writes**: `O_final` to a **dedicated scratchpad region** (sized for the 8 per-head output tiles) — not back into the accumulator. Corrected during DMA scoping (§3): DMA is HBM↔scratchpad only, never accum-facing, so the finished output has to land somewhere DMA can already reach.
+
+### `metadata-init`
+Issued once per head, at the top of each Q-tile — writes the online-softmax
+recurrence's initial state (`m_0=-inf, l_0=0, O_0=0`) into that head's
+accumulator location, so chunk 1's real `softmax-update` can read genuine
+prior state instead of needing to special-case the first chunk
+(`notes.md` §11.9).
+
+| Field | Width | Meaning |
+|---|---|---|
+| opcode | — | `metadata-init` |
+| head-idx | 3 bits | Resolves `m`, `l`, `O` against the same three hardcoded bases `softmax-update` uses. |
+
+- No value fields — `-inf`/`0`/`0` are genuine hardware constants (same every head, every Q-tile), not compile-time-varying operands, so they cost zero bits.
+- Kept as its own opcode rather than a mode bit on `softmax-update`: both cost SFU the same extra bit (2 vs. 3 SFU instructions both need a 2-bit opcode), so it's not cheaper — but a separate opcode keeps the hot-path instruction (512 issues/Q-tile) uniform, never branching on which chunk it's processing. Same move as `load-stationary`'s permanently-engaged transpose bit (§1): the opcode is the proxy for the special case, not a runtime flag inside a shared instruction.
 
 ---
 
@@ -187,7 +202,7 @@ NOP).
 per-Q-tile instruction counts, accounting for the fine-grained per-128-wide-
 slice softmax granularity (`prefill_notes.md` §2.3 — 8 slices per chunk,
 matching `load-stationary`'s slice-idx field), are matmul-issue=1,152,
-SFU=520, DMA=32 (≈36:16:1) — i.e. even under a best-case schedule
+SFU=528 (`notes.md` §11.9 adds `metadata-init`'s 8), DMA=32 (≈36:16.5:1) — i.e. even under a best-case schedule
 bottlenecked by matmul-issue, SFU is idle ~55% of cycles and DMA ~97%. So
 this is *not* "every slot is always busy" (that intuition doesn't hold up
 against the real numbers, and holds up even less once the real slicing
@@ -209,7 +224,8 @@ can hold — a real risk given there's no hardware loop construct at all).
 
 **Opcode widths** (mechanical, `ceil(log2(instruction count))` per slot,
 now that each slot has its own fixed field): matmul-issue (3 types) → 2
-bits; SFU (2 types) → 1 bit; DMA (3 types) → 2 bits.
+bits; SFU (3 types, since `metadata-init` — `notes.md` §11.9) → 2 bits;
+DMA (3 types) → 2 bits.
 
 **Per-slot width** = opcode + the slot's worst-case instruction (fixed
 width means every instruction in a slot must fit the slot's max):
@@ -217,11 +233,12 @@ width means every instruction in a slot must fit the slot's max):
 | Slot | Opcode | Worst-case fields | Slot width |
 |---|---|---|---|
 | Matmul-issue | 2 bits | `load-stationary`'s 5-bit src | **7 bits** |
-| SFU | 1 bit | 3-bit head-idx (both instructions identical) | **4 bits** |
+| SFU | 2 bits | 3-bit head-idx (all three instructions identical) | **5 bits** |
 | DMA | 2 bits | `load-Q`/`store-O`'s 19 bits (16-bit offset + 3-bit head-idx) | **21 bits** |
 
-**Total bundle width: 7 + 4 + 21 = 32 bits.** One 32-bit word per cycle,
-fixed position per slot, no parsing required to decode.
+**Total bundle width: 7 + 5 + 21 = 33 bits** (was 32 before `metadata-init`
+— `notes.md` §11.9). One 33-bit word per cycle, fixed position per slot,
+no parsing required to decode.
 
 ## 5. Capacity check (real numbers, not assumed)
 
@@ -240,8 +257,8 @@ fixed position per slot, no parsing required to decode.
 | Region | Size |
 |---|---|
 | Per-head metadata (`m`,`l`) + output accumulator `O`, combined (§2.3's original `8×520×tile_q` term) | 133,120 B |
-| Raw-S/P transient block (single reused, fp32) | 16,384 B |
-| **Total** | **149,504 B** (slack ≈ 110 KB) |
+| Raw-S (double-buffered, fp32 — `notes.md` §11.8) | 32,768 B |
+| **Total** | **165,888 B** (slack ≈ 94 KB) |
 
 Both fit comfortably. Underlying address-bus widths (RTL detail, not
 instruction-encoding — these never appear as instruction bits, since the
@@ -252,22 +269,25 @@ GiB GQA-fused total).
 
 ---
 
-## 6. Summary table — all 8 instructions
+## 6. Summary table — all 9 instructions
 
 | Slot | Instruction | Fields | Slot width | Issued (per Q-tile) |
 |---|---|---|---|---|
 | Matmul-issue | `load-stationary` | opcode(2) + 5-bit src (2-bit buffer-select + 3-bit slice-idx) | 7 bits | per (chunk, slice, K-or-V) = 8×8×2 = **128** |
 | Matmul-issue | `steady-state-stream-qk` | opcode(2) + 3-bit head-idx | 7 bits (padded) | per (chunk, slice, head) = 8×8×8 = **512** |
 | Matmul-issue | `steady-state-stream-v` | opcode(2) + 3-bit head-idx | 7 bits (padded) | per (chunk, slice, head) = **512** |
-| SFU | `softmax-update` | opcode(1) + 3-bit head-idx | 4 bits | per (chunk, slice, head) = **512** |
-| SFU | `softmax-finalize` | opcode(1) + 3-bit head-idx | 4 bits | per head, after last chunk = **8** |
+| SFU | `softmax-update` | opcode(2) + 3-bit head-idx | 5 bits | per (chunk, slice, head) = **512** |
+| SFU | `softmax-finalize` | opcode(2) + 3-bit head-idx | 5 bits | per head, after last chunk = **8** |
+| SFU | `metadata-init` | opcode(2) + 3-bit head-idx | 5 bits | 8× per Q-tile, before chunk loop = **8** |
 | DMA | `load-Q` | opcode(2) + 16-bit HBM offset + 3-bit head-idx | 21 bits | 8× per Q-tile = **8** |
 | DMA | `load-K/V` | opcode(2) + 11-bit HBM offset + 2-bit dest-select | 21 bits (padded) | 1× per chunk × 2 (K,V) = **16** |
 | DMA | `store-O` | opcode(2) + 3-bit head-idx + 16-bit HBM offset | 21 bits | 8× per Q-tile = **8** |
 
-**Total bundle: 32 bits** (7 + 4 + 21, fixed-width-per-slot, §4). Per-slot
-totals: matmul-issue = 1,152, SFU = 520, DMA = 32 (`notes.md` §9.3 — the
-slicing granularity that was missing from the first pass of this count).
+**Total bundle: 33 bits** (7 + 5 + 21, fixed-width-per-slot, §4 —
+grew from 32 when `metadata-init` pushed SFU's opcode from 1 to 2 bits,
+`notes.md` §11.9). Per-slot totals: matmul-issue = 1,152, SFU = 528
+(512 + 8 + 8, `notes.md` §9.3 for the base count, §11.9 for the
+`metadata-init` addition), DMA = 32.
 
 **Notable emergent property**: every head-touching instruction across
 *all three* slots ends up issued exactly once per head — never bulk,

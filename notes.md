@@ -1094,6 +1094,7 @@ load-bearing; revisit only if a real schedule turns out SFU-bound.
 | `load-stationary` | 128 |
 | `steady-state-stream-qk` / `-v` | 159 |
 | `softmax-update` / `softmax-finalize` | 32 |
+| `metadata-init` | 32 (added §11.9/§11.11 — writes `O` (32×128) through the same per-row write path `softmax-update`/`-finalize` use, so assumed to share their 32-cycle shape rather than being near-instant) |
 | `load-K/V` | 159.844 (raw, pre-clock) |
 | `load-Q` / `store-O` | 4.995 (raw, pre-clock) |
 
@@ -1184,3 +1185,385 @@ Latency derivation and the clock decision are both done (§11.3–§11.6).
    sequence — start with one (chunk, slice) sub-iteration as the
    representative unit, verify it, then generalize across the full loop
    nest with the prologue/epilogue folded in.
+
+### 11.8 Methodology correction, two settled decisions, and a full hazard pass — before any bundle placement
+
+A first attempt at item 3 above (interleaving `load-Q` issuance with the
+first slice's `steady-state-stream-qk`/`load-stationary` to fill idle
+slots) got caught mid-derivation as premature optimization — packing
+bundles tightly before the underlying dependency graph and execution
+model were actually settled. Correct order, same shape as Itanium's own
+kernel-before-rotating-register-overlap sequencing (§1.1) and CS243 list
+scheduling's own dependency-graph-before-packing structure: **settle
+hazards and the slot-occupancy model, build a naive correct schedule,
+then optimize.** The two real open items surfaced during that premature
+pass turned out to be genuine correctness prerequisites, not
+optimizations — resolved here.
+
+**Real hazard found: raw S's single accumulator location.** `isa.md`
+(pre-edit) gave raw S a single fixed accumulator location, zero bits,
+justified by "`softmax-update` consumes it immediately... no reload gap."
+That's only safe *within* one head. Across heads it's a live WAR hazard:
+`steady-state-stream-qk(head i+1)` cannot overwrite S until
+`softmax-update(head i)` has read it. Unfixed, under the busy-for-
+full-latency model decided below, that's a real stall of
+`softmax-update`'s full 32-cycle latency at every head transition — 7
+transitions/slice × 8 slices/chunk × 8 chunks = 448/Q-tile × 32 =
+**14,336 stall cycles/Q-tile**, an avoidable ~8% tax on top of the
+179,200 real matmul-issue cycles/Q-tile (§11.6).
+
+**Rejected fix: ×8 (one S location per head), same as P/O/metadata.**
+Checked against capacity, not assumed — S is `tile_q × 128 × 4B (fp32)`
+= 16,384 B/instance, so ×8 = 131,072 B, pushing the accumulator to
+264,192 B against the 262,144 B budget, over by ~2 KB. (This exact
+number was already on record without the connection being made at the
+time — §9.1's "coarse was tried first and rejected because it overflows
+the accumulator budget by 2 KB (133,120 B + 131,072 B coarse raw-S)" is
+the identical ×8/coarse-raw-S overflow, independently re-derived here.)
+
+**Chosen fix: double-buffer S (×2), not ×8 — and zero new instruction
+bits, not one.** `softmax-update` (32 cycles) is far shorter than
+`steady-state-stream-qk` (159 cycles), so alternating `qk(head i)`
+between two S buffers means the *other* buffer is always long-since free
+by the time it's needed again three heads-worth of latency later — the
+hazard disappears completely, not just shrinks. Cost: +16,384 B
+(accumulator total 165,888 B, slack ≈ 94 KB — comfortable, same shape as
+every other capacity check in this project).
+
+On the encoding: an initial framing proposed a dedicated 1-bit
+buffer-select field on `steady-state-stream-qk`. Checked against this
+project's own standing principle (§ "compile-time-known ≠ operand-free,"
+handoff.md) run in the other direction — a value only needs a real bit
+if hardware *can't* derive it from something already present. Buffer
+selection here is exactly `head_idx & 1`, and `head-idx` (3 bits) is
+already carried on both `steady-state-stream-qk` (for the Q source) and
+`softmax-update` (for metadata/O/P) — so **zero new bits**, hardware
+just reads one more bit out of a field already there. Direct precedent
+already in this ISA: DMA's `dest-select` K-vs-V bit already does double
+duty as both an HBM-base mux and a scratchpad-region selector (§7.3,
+`isa.md` `load-K/V`) — same move. (Doesn't change total bundle width
+either way here, since `load-stationary`'s 7-bit slot is already the
+matmul-issue ceiling — but the zero-bit version is still preferred: it's
+structurally impossible for a compiler to get wrong, versus a
+compiler-supplied bit that has to be computed correctly every time.)
+Applied to `isa.md` §1 (`steady-state-stream-qk`'s field table), §2
+(`softmax-update`'s Reads line), and §5 (capacity table, now 165,888 B /
+94 KB slack).
+
+**Slot-occupancy model, decided: busy for the instruction's full latency,
+uniformly across all three slots** (matmul-issue, SFU, DMA) — not
+issue-and-free. Two independent grounds, not just "simpler to program":
+(1) for matmul-issue it's physically forced, not a modeling choice — the
+array can't accept a new `load-stationary` or start a new stream while
+one is mid-flight, same physical PEs; (2) making DMA follow the same rule
+keeps one uniform rule instead of two, costs nothing given DMA's existing
+~70× slack (§11.6), and avoids needing any completion-tracking hardware
+for outstanding transfers — which would edge toward the OOO-ish
+machinery Decision 2 already ruled out (§3). Uniform blocking keeps the
+whole model purely static, consistent with the compiler already knowing
+every instruction's completion time ahead of time.
+
+**Deliberate hazard pass (checked every other shared piece of state, not
+just S):**
+
+- **Array stationary registers** (one operand at a time) — safe, and not
+  a separate hazard: matmul-issue slot serialization (from the
+  busy-for-full-latency decision above) already forces `load-stationary`
+  to wait for the prior stream to finish on the same slot.
+- **P (×8 per-head, scratchpad)** — WAR across slices (`softmax-update`
+  of slice `s+1` overwriting P before slice `s`'s `steady-state-stream-v`
+  has read it) is safe *only because* of the established strict
+  K-phase-then-V-phase, no-reordering execution order (§6.3/§9.4's
+  slice-interleaving rule). Flagged, not fixed: this is currently safe by
+  construction, not by an explicit guard — must be re-checked if any
+  later optimization pass ever reorders across slice boundaries.
+- **O accumulator, two different writers** — `softmax-update(head i)`
+  rescales O, then later in the same slice `steady-state-stream-v(head
+  i)` adds `P@V` into the same O. Real ordering dependency, not
+  previously named explicitly as a hazard — but automatically satisfied
+  by the same K-phase-before-V-phase rule, and unlike S, O already has
+  proper ×8 per-head addressing, so there's no cross-head version of this
+  problem the way there was for S.
+- **Metadata (`m`,`l`) recurrence across chunks** — ordinary sequential
+  RAW chain per head, already enforced by chunk-loop program order, not a
+  scheduling hazard.
+- **`softmax-finalize` → `store-O`** — fully sequenced by the loop nest
+  (all finalizes before any stores), ample slack.
+
+**Net finding: S was the only instance producing a live scheduling
+hazard.** Everything else holds, though P's WAR-safety and O's
+write-ordering both currently depend on the naive in-order, no-reordering
+execution model — worth re-verifying rather than assuming once
+optimization starts moving things around.
+
+### 11.9 Second prologue gap found while resolving item 1: metadata has no initialization instruction
+
+While working out item 1 (the §11.2 K/V prologue), a proposed fix of
+"prologue = `load-K/V(K, chunk 0)` + `load-K/V(V, chunk 0)`" correctly
+covers the K/V half of §11.2 but missed a separate, previously-uncaught
+gap: `isa.md` §2's own recurrence requires `m_0=-inf, l_0=0, O_0=0` before
+chunk 1's *real* `softmax-update` can run (it reads `m_0`/`l_0`/`O_0` as
+genuine prior state, not a special case), and **no instruction in the ISA
+writes those values anywhere**. Missed even in §11.8's "deliberate hazard
+pass" — that pass checked the chunk-to-chunk metadata *recurrence* (safe,
+ordinary RAW chain) but never checked the recurrence's *base case*.
+
+Same granularity as `load-Q`, for the same reason: the 8 per-head
+accumulator slots are physically reused across all 65,536 (batch,
+kv_group, q_tile) instances, so this has to happen fresh every Q-tile, not
+once globally.
+
+**Three options weighed:**
+1. New SFU opcode (`metadata-init`), separate instruction.
+2. Mode bit on `softmax-update` itself for the chunk-1 case.
+3. Piggyback on `load-Q` (already fires once per Q-tile per head — same
+   frequency, same head-idx addressing) as a free side effect.
+
+**Option 3 rejected outright, not just weighed** — `isa.md` §3 states DMA
+is HBM↔scratchpad only, never accumulator-facing, and §6.5 already used
+that exact rule once before to move `softmax-finalize`'s destination out
+of the accumulator. Tying metadata-init to `load-Q` would need the DMA
+engine to write the accumulator directly, violating a boundary this
+project already settled on real grounds, not just adding an awkward
+coupling.
+
+**1 vs. 2 checked and found to cost the same, contrary to how they first
+looked.** `softmax-update` has no chunk-index field today (chunk is
+implicit in schedule position, never encoded in any instruction) — so
+telling hardware "this is chunk 1" needs a new bit *somewhere* either way.
+Whether that bit widens the opcode (option 1: 2 SFU instructions → 3) or
+is added as a same-instruction mode flag (option 2), SFU's opcode grows
+1→2 bits and the slot grows 4→5 bits regardless — identical cost.
+
+**Chosen: option 1.** Given equal cost, a separate opcode keeps
+`softmax-update` (512 issues/Q-tile, the hot path) uniform — it always
+reads real accumulator state, never branching on which chunk it's
+processing — and confines the new complexity to a rare (8 issues/Q-tile),
+trivially simple instruction instead. Same move this project already made
+once for `load-stationary`'s transpose bit: permanently-engaged,
+opcode-as-proxy, rather than a runtime-conditional flag inside a shared
+instruction (`isa.md` §1).
+
+**ISA changes applied** (`isa.md`): new `metadata-init` instruction added
+to the SFU slot (§2) — head-idx only, no value fields (`-inf`/`0`/`0` are
+genuine hardware constants, zero bits, same distinction as everywhere else
+in this ISA). SFU is now 3 instructions, not 2: opcode 1→2 bits, slot
+width 4→5 bits, **total bundle width 32→33 bits** (§4, §6). SFU per-Q-tile
+count 520→528. No capacity change — it writes into already-provisioned
+accumulator locations, no new storage.
+
+**Resolved**: `phase2-loop.md` now opens with the full prologue block —
+`load-K/V(K, chunk 0)`, `load-K/V(V, chunk 0)`, `metadata-init ×8`,
+`load-Q ×8` — replacing the old standalone `load-Q ×8` line. Order among
+the three groups isn't load-bearing (mutually independent, no shared
+resource); `load-K/V(K, chunk 0)` is placed first only because it's the
+one on the real critical path (gates the first `load-stationary`).
+
+### 11.10 Epilogue resolved: chunk 7 peeled out of the loop, no conditional
+
+The other half of §11.2 — the in-loop trailing prefetch
+(`load-K/V(K/V, next chunk)`) targets `chunk + 1`, which doesn't exist for
+`chunk`=7 (chunks are 0..7, 8 total). Same discipline as the prologue:
+this is a literal, compile-time-unrolled structural difference in the
+last iteration's body, not a runtime guard — this ISA has zero branch
+instructions (Note on Scope), so an `if chunk < 7` framing was never on
+the table.
+
+**Resolved by peeling chunk 7 out of the loop** in `phase2-loop.md`: the
+loop now runs `for chunk in 0..7` (chunks 0–6, each still followed by its
+trailing prefetch) with chunk 7's identical slice-loop body written out
+separately afterward, minus the trailing `load-K/V` pair. Straightforward
+— no new instructions, no field/capacity changes, unlike the prologue and
+`metadata-init` fixes.
+
+**§11.2 (both halves) is now fully resolved.** `phase2-loop.md` reflects
+both fixes.
+
+### 11.11 First real timeline computed: the prologue, and a stall found in the original DMA order
+
+First application of §11.8's busy-for-full-latency model to real numbers,
+using the prologue as the smallest unit (`notes.md` §11.4's latency
+table, including `metadata-init`'s newly-assigned 32 cycles above).
+
+**Under the DMA order originally written into `phase2-loop.md`** (`K`,
+`V`, then `Q ×8`): `K` done at 159.844; `V` done at 319.688;
+`Q(head 0)` done at 324.683. Meanwhile `load-stationary(K, slice 0)`
+starts the moment `K` lands (159.844) and finishes 128 cycles later, at
+287.844 — which is when `steady-state-stream-qk(head 0)` wants to issue.
+It needs `Q(head 0)`, not ready until 324.683 → **a real ~37-cycle stall**
+(324.683 − 287.844), sitting on the matmul-issue slot, that nothing in
+the earlier derivation had caught because latency numbers hadn't been
+walked through as an actual timeline yet.
+
+**Fix: reorder DMA to `K`, `Q ×8`, `V`.** Mechanism, not just a
+retry-until-it-works swap: total DMA occupancy across the three groups is
+order-invariant (it's a sum of fixed latencies, 359.648 cycles either
+way) — reordering only changes *which* instruction becomes ready first,
+not how much total DMA time elapses. So the right move is to rank the
+three groups by how tight their real deadline is and issue the tightest
+first. `Q(head 0)`'s deadline (287.844, set by `load-stationary`) is by
+far the tightest in the prologue; `V`'s deadline (~1,560, set by when
+slice 0's full K-phase finishes and `load-stationary(V, slice 0)` can
+issue) is by far the loosest. Under `K → Q ×8 → V`: `Q(head 0)` finishes
+at 164.839 (no stall), `V` finishes at 359.648 (still ~1,200 cycles of
+slack before its own deadline). Zero-cost fix — moves a stall, creates
+none.
+
+Checked whether `Q(head 1..7)` had the same exposure under the *original*
+order too: no — each later head's deadline is ~159 cycles further out
+than the previous (`steady-state-stream-qk` chained on the matmul-issue
+slot), which was already enough slack to cover the original
+`K → V → Q` ordering for every head except head 0. Head 0 was the one
+real problem, consistent with it being the very first consumer in the
+whole Q-tile.
+
+**`metadata-init ×8` needs no such reordering** — SFU-slot, fully
+independent of the DMA-side timeline above, finishes all 8 heads by cycle
+256 regardless of DMA order, well before its own first consumer
+(`softmax-update(head 0)`, unreachable before `steady-state-stream-qk
+(head 0)` completes at 446.844). Considered explicitly pairing it
+head-for-head with `load-Q` in the same bundle cycle — rejected: the two
+slots' natural timelines don't line up per-head anyway (SFU runs far
+ahead of DMA under the corrected order), and forcing alignment would mean
+artificially stalling the faster slot for no benefit. Left as its own
+independent list.
+
+`phase2-loop.md` updated to the corrected order (`K`, `Q ×8`, `V`, then
+`metadata-init ×8` as its own list).
+
+### 11.12 Slice 0's full timeline, the slice/chunk generalization, and the chunk-boundary DMA analysis
+
+Building the naive schedule forward from the prologue's end (287.844 —
+the cycle `load-stationary(K, chunk 0, slice 0)` finishes and
+`steady-state-stream-qk(head 0)` can issue, per §11.11).
+
+**K-phase pipelining, and a real off-by-one caught along the way.** The
+first attempt at walking this forward started each head's instructions
+one cycle later than necessary (e.g. `qk(head 0)` "288→447" then the
+*next* instruction at 448, not 447) — checked and corrected: `447` is
+already `qk(head 0)`'s first free cycle (`288+159=447` exactly), so the
+next instruction can start *at* 447, not 448. Uncorrected, this silently
+inserts a 1-cycle bubble on the matmul-issue slot per head transition —
+7 of them per slice, 448/Q-tile if the habit had propagated, comparable
+in kind (if far smaller in magnitude) to the S-accumulator stall §11.8
+fixed. Corrected general pattern, for head `i`, K-phase starting at 288:
+
+- `steady-state-stream-qk(head i)`: `288 + 159i` → `288 + 159(i+1)`
+- `softmax-update(head i)`: starts the same cycle `qk(head i)` ends
+  (no wait — this is exactly the payoff of §11.8's S double-buffering fix:
+  `qk(head i+1)` doesn't need `softmax-update(head i)` to finish at all,
+  since they write different S buffers), runs 32 cycles. SFU is never the
+  bottleneck (32 ≪ 159 gap between heads), consistent with the ~55% SFU
+  idle finding already on record (`isa.md` §4).
+
+K-phase (8 heads) runs 288 → 1,560.
+
+**V-phase: checked for hazards, found genuinely simple.** Confirmed
+`load-stationary(V, slice 0)` co-issues with `softmax-update(head 7)` at
+1,560 (different slots, `load-stationary` touches neither S, P, nor the
+accumulator, so zero dependency on `softmax-update`). Confirmed
+`steady-state-stream-v ×8` really is just sequential back-to-back with
+nothing to schedule around it — unlike `qk`'s raw-S problem, P and O
+already had proper ×8 per-head addressing from Phase 1, so there's no
+cross-head hazard, and both SFU and DMA are completely idle throughout
+(SFU's only K-phase-scoped work is done; DMA has nothing chunk-0-related
+left to do, see below). V-phase: 1,688 → 2,960.
+
+**Slice 0 finishes at 2,960.** Cross-check: total matmul-issue span
+(159.844 → 2,959.844) ≈ 2,800 cycles, exactly matching §11.6's
+independently-derived per-slice figure (128+1,272+128+1,272) — everything
+built cycle-by-cycle here is consistent with the earlier aggregate
+estimate.
+
+**Slices 1–6 generalize, but are simpler than slice 0, not identical.**
+`load-stationary(K, slice N)` for `N≥1` has no DMA gate at all — chunk
+0's K/V is already fully resident, so slice `N` starts the instant the
+matmul-issue slot frees up (right when slice `N-1`'s V-phase ends), no
+prologue-style wait. Each slice after the first is exactly 2,800 cycles,
+back-to-back. Chunk 0 (8 slices) finishes at matmul-issue cycle
+159.844 + 8×2,800 = **22,559.844** — matches §11.6's 22,400
+cycles/chunk figure exactly (22,559.844 − 159.844).
+
+**Closing out §11.8's flagged P/O cross-slice hazards, with real
+numbers, not just "safe by construction."** §11.8 flagged P's WAR-safety
+and O's rescale-then-add ordering as correct only *because of* strict
+K-phase-then-V-phase, no-reordering execution — worth re-checking, not
+assuming. Checked: slice `N+1`'s `softmax-update(head i)` (which
+overwrites P[head i] and rescales O[head i]) happens at minimum a full
+slice's worth of cycles (~2,800) after slice `N`'s `steady-state-stream-v
+(head i)` (which read P[head i] and added into O[head i]) — nowhere close
+to zero margin. **Both items are now confirmed safe with numbers, closed
+out.**
+
+**Chunk-boundary DMA: the in-order-per-slot model has a real, useful
+consequence — textual position in `phase2-loop.md` doesn't change the
+actual timeline unless something else genuinely competes for the slot.**
+DMA is in-order (no OOO, Decision 2), so it processes its own
+instructions in whatever order they appear across the *whole* unrolled
+program. Chunk 0's entire slice loop contains zero DMA instructions, so
+`load-K/V(K, chunk 1)` is already DMA's literal next instruction after
+the prologue's `V(chunk 0)` — whether it's textually written inside the
+prologue block or left at the end of chunk 0's loop iteration produces
+the identical schedule. **Folded into the prologue in `phase2-loop.md`
+for clarity — this was a zero-cost move, not an optimization.**
+
+Checked whether the same move should be made for chunk 2's prefetch
+(`load-K/V(K/V, chunk 2)`, which needs the *other* double-buffer instance
+chunk 0 is using) — **decided not to, and confirmed with real numbers
+rather than left as an assumption:**
+- Chunk 0's last reads of K1/V1 (`load-stationary(K/V, chunk 0, slice
+  7)`) finish at 19,887.844 / 21,287.844 respectively.
+- DMA (idle since 679.336, per the same in-order argument) issues
+  `K(chunk 2)` the moment K1 frees (19,887.844→20,047.688), then
+  `V(chunk 2)` the moment V1 frees (21,287.844→21,447.688) —
+  **regardless of whether the instruction is textually attached to
+  chunk 0's or chunk 1's loop iteration**, since chunk 1's slice loop
+  also has zero DMA instructions in it.
+- Chunk 2's data is ready by 21,447.688; chunk 1 (starting right where
+  chunk 0 ends, no stall of its own) doesn't reach `load-stationary(K,
+  chunk 2, slice 0)` until 44,959.844 — **~23,500 cycles of margin**,
+  more than a full chunk's worth, tighter and better-grounded than
+  §11.6's general ~70× conservative bound.
+- **Restructuring the loop to explicitly move chunk 2 (and beyond)
+  earlier would cost real complexity for zero benefit**: it would double
+  the §11.10 epilogue special-casing (both chunk 6's and chunk 7's
+  would-be trailing prefetches would then target nonexistent chunks,
+  instead of just chunk 7's). Left exactly where it already sits.
+
+**Honest status check — this is not yet "the hand schedule, optimized."**
+Real ground covered (prologue, slice 0 in full, the slice/chunk
+generalization, chunk-boundary DMA through chunk 2), but explicitly not
+done:
+1. **The tail is completely undeveloped** — `softmax-finalize ×8` and
+   `store-O ×8`, after all 8 chunks. Real dependency chain
+   (`softmax-finalize(head i)` needs chunk 7's `softmax-update(head i)`;
+   `store-O(head i)` needs `softmax-finalize(head i)`) never walked
+   through.
+2. **Nothing has actually been transcribed into a literal bundle-by-bundle
+   table yet** — everything above is start/end cycle reasoning per
+   instruction, not a cycle-by-cycle bundle document.
+3. **The outer `batch`/`kv_group`/`q_tile` loops are excluded from scope
+   by design (§11.1), and that hides a real, unexplored optimization**:
+   the ~160-cycle prologue wait recurs every Q-tile (65,536× total).
+   Whether the next Q-tile's prologue can overlap with the current
+   Q-tile's tail (cross-iteration software pipelining, the same Itanium
+   technique cited since §1.1) has never been asked, because it was
+   scoped away — a deliberate choice, not a gap that was missed, but
+   worth being explicit that it's still open.
+4. **"No avoidable stalls found" is a more honest claim than
+   "optimized."** Everything checked out because the hard architectural
+   constraints (one stationary operand at a time; the softmax recurrence's
+   sequential chunk dependency) left little room to begin with — but no
+   alternative orderings were tried and compared, so this shouldn't be
+   asserted as proven-optimal.
+5. **The automated scheduler (`spec.md`'s second required Phase 2
+   deliverable, real list-scheduling/software-pipelining, same loop nest
+   and ISA, specifically so Phase 3 can compare the two honestly) hasn't
+   been started at all.**
+
+**Next**: derive the tail (`softmax-finalize`/`store-O`'s real dependency
+chain and timeline), then transcribe the full prologue→slice-0→
+generalization→tail derivation into an actual bundle-by-bundle sequence
+(item 2 above) — that's the literal Phase 2 hand-schedule deliverable.
+Items 3 and 5 above are real, explicitly-flagged open scope, not
+next-in-line.
