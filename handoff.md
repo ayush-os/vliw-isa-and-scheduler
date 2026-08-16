@@ -260,20 +260,43 @@ Full reasoning: `notes.md` §11.9. `isa.md` is current; every "8
 instructions" / "32 bits" reference elsewhere in this file (including
 just above) reflects Phase 1's state at the time and is superseded.
 
-## Phase 2: IN PROGRESS — prologue/epilogue resolved, slice 0 + generalization + chunk-boundary DMA derived; tail and literal bundle write-up still open
+## Phase 2: hand-schedule built and independently audited, then a major occupancy-model bug found — fixing it is the real next step, before the automated scheduler
+
+**Status in one paragraph, read this first**: the hand-schedule got to a
+complete, internally-consistent 179,397-cycle answer (`bundle-schedule.md`),
+then an independent audit agent was dispatched to sanity-check it before
+building the automated scheduler. The audit found two small doc bugs
+(fixed) and one major finding: the slot-occupancy model itself (busy for
+an instruction's *full* latency) conflates a systolic pipeline's *drain
+time* with real issue *occupancy* for the two streaming instructions —
+confirmed against real Timeloop simulation data already on record in
+`prefill_notes.md` §3.1 (100% utilization is achievable on this exact
+array; this schedule implies ~18%). **Decision made (`notes.md` §11.19):
+fix this before building the automated scheduler**, since building it
+against a known-wrong occupancy model would be wasted work. Real
+potential impact: **~5.5× faster** (179,397 → ~33,000 cycles) if both the
+occupancy fix and a companion `load-stationary` shadow-register idea are
+adopted together — see §11.19 for the full breakdown, including which
+part is strongly confirmed vs. which part is plausible-but-unverified.
 
 Per `spec.md` Phase 2: hand-schedule the real bundle sequence first
 (before the automated scheduler). **Full working log: `notes.md` §11**
 — §11.1–§11.7 is latency/clock-decision groundwork from an earlier
-session; **§11.8 onward is the current session's work and the real
-pickup point.**
+session; §11.8–§11.16 is the hand-schedule derivation (now superseded by
+the occupancy-model bug, but the hazard-finding methodology in it is
+still correct and will be re-applied); **§11.17–§11.19 is the current
+real pickup point** — §11.17's roadmap decision (skip cross-iteration
+pipelining, scope the automated scheduler down), §11.18's audit findings,
+§11.19's decision to fix the occupancy model first, with a concrete
+numbered "Next" list to resume from.
 
 **Scope**: one Q-tile's steady-state body, written out in
 [`phase2-loop.md`](phase2-loop.md) — the outer `batch`/`kv_group`/`q_tile`
 loops are identical repeats at different addresses, not new scheduling
 content, so they're intentionally excluded from that file. **This
-exclusion hides a real, unexplored optimization — see "Not yet done"
-item 3 below, it's a deliberate scoping choice, not a forgotten thread.**
+exclusion hides a real, unexplored optimization (cross-iteration software
+pipelining) — evaluated below in "Roadmap for the rest of Phase 2" and
+deliberately dropped on real numbers, not a forgotten thread.**
 
 **Done, this session, in order** (`notes.md` §11.8–§11.12 has full
 derivations, every real correction, and worked numbers for all of this):
