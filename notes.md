@@ -1601,3 +1601,155 @@ generalization→tail derivation into an actual bundle-by-bundle sequence
 (item 2 above) — that's the literal Phase 2 hand-schedule deliverable.
 Items 3 and 5 above are real, explicitly-flagged open scope, not
 next-in-line.
+
+### 11.13 Bundle-table transcription started: format decided, prologue done with corrected latencies
+
+Picking up item 2 above (the literal bundle-by-bundle table). Two things
+settled before writing any real table, both worth keeping:
+
+**Scope: representative segments, not a literal 179k-row table.** A row
+per real cycle across the whole Q-tile isn't a thing to hand-transcribe —
+almost all of it is idle bundles between real issue points, same
+"idle-slot cost is storage/code-density, not throughput" framing already
+on record from §8.1. Instead: one real bundle table per distinct segment
+(prologue, slice 0, a generic steady-state slice, chunk-boundary DMA, the
+tail), with repeats (slices 1–6, chunks 0–7) called out symbolically —
+same discipline `phase2-loop.md` already uses at the loop-nest level, now
+one level down at the bundle level.
+
+**Row/column format: merged (not per-slot) table, one row per issue
+event.** A row exists for every cycle where ≥1 of the three slots
+dispatches a *new* instruction; cycles where a slot merely stays busy with
+something dispatched earlier don't get their own row. Each cell is one of
+three explicit states, not just filled-or-blank:
+- a new dispatch this cycle — mnemonic + operands (e.g. `load-Q(head 0)`),
+- still busy with something dispatched earlier — `⋯ <mnemonic>, busy til
+  <cycle>`,
+- genuinely idle, nothing to do — `idle`.
+
+Mnemonic + named operands (head-idx, slice-idx, K/V-select, etc.), not raw
+encoded bits — the raw 33-bit encoding is a mechanical last step once the
+schedule itself is right, not where any real synthesis happens. Caveat
+worth keeping: "idle" describes that specific cycle only, not the whole
+gap since the previous row — a slot can in principle go idle→busy→idle
+between two consecutive rows if something else dispatches on it in
+between (doesn't happen in the prologue, since each slot's own
+instructions are already spaced apart, but will start showing up once
+DMA's chunk-prefetches interleave with steady-state work).
+
+**Prologue transcribed with the §11.4 ceiling fix applied** — full table
+in `bundle-schedule.md`. Structure and ordering match §11.11 exactly
+(`K → Q ×8 → V`, `metadata-init ×8` independent on SFU); only the exact
+cycle numbers changed, and all landed on clean integers once ceiling'd
+(160, 165, 170, ..., 288, 447 — no more `.844`/`.839` fractions), which is
+itself a small confirmation the fix was right, not just physically
+motivated. Head 0's `Q` still lands (165) well before `load-stationary`
+frees the matmul-issue slot (288), so the original stall-avoidance finding
+is unaffected — margins shrank by single-digit cycles, nowhere close to
+reopening anything.
+
+**Not yet re-derived with ceiling'd latencies**: slice 0's full timeline,
+the chunk cadence, and the tail figures from §11.12 — all still carry the
+stale fractional numbers until they're redone the same way the prologue
+just was. Do that before transcribing those segments into
+`bundle-schedule.md`.
+
+### 11.14 Slice 0 transcribed, and a reframing: the matmul-issue/SFU table is universal, not per-slice
+
+Slice 0 re-derived with ceiling'd latencies and transcribed into
+`bundle-schedule.md` — cross-checks exactly against the established
+2,800-cycle/slice figure. Confirmed along the way: `load-stationary(V,
+slice 0)` is forced to wait for `qk(head 7)` (matmul-issue slot
+serialization) but *not* for `softmax-update(head 7)` (different
+resource) — consistent with §11.8's hazard pass. Also confirmed the
+chunk-1 DMA prefetch genuinely issues at cycle 360 (the moment `V(chunk
+0)` frees DMA), not later — direct application of the in-order/
+textual-position-doesn't-matter finding from §11.12, this time to a case
+that was actually asked about live rather than found unprompted.
+
+**Reframing, prompted by checking "do slices 1–6 just drop the
+metadata-init/DMA activity slice 0 had": no — those were never part of
+slice 0's own pattern.** `metadata-init` and the chunk-1 prefetch are
+independent SFU/DMA events that merely overlap slice 0's *early* cycles in
+absolute time; stripping them out, slice 0's own matmul-issue/SFU shape
+matches a slice-generic relative-offset table cycle-for-cycle. So the
+right structure isn't "one table per slice type" — it's **one universal
+matmul-issue/SFU table (parameterized by `slice_start`) plus a DMA overlay
+that's the only thing actually varying per slice**: slice 0 gets the
+prologue continuation, slices 1–6 get nothing, slice 7 gets the
+chunk-boundary prefetch. `bundle-schedule.md` restructured around this;
+its scope note now explains why the original five-segment plan (prologue/
+slice-0/generic-slice/chunk-boundary/tail as five separate full tables)
+undersold how much of the schedule is actually shared.
+
+**Next**: the chunk-boundary DMA overlay (slice 7 of chunks 0–6) — needs
+the WAR-hazard-clears cycle (when chunk `c`'s last read of the reused
+double-buffer instance actually frees it) re-derived with ceiling'd
+latencies; old fractional version is in §11.12's chunk-2 case. Then the
+tail, same re-derivation treatment.
+
+### 11.15 Chunk-boundary DMA overlay: K/V halves gated by different real readers, transcribed
+
+Re-derived with ceiling'd latencies and written into `bundle-schedule.md`.
+One real correction caught mid-derivation: a first pass tied `load-K/V(K,
+chunk+2)`'s issue to `load-stationary(V, slice 7)` (temporally nearby,
+same slice) rather than to its own actual WAR-hazard gate,
+`load-stationary(K, chunk c, slice 7)` — the true *last reader* of the
+K-buffer instance being reused (each slice's `load-stationary(K)` is the
+only thing that ever reads the K-scratchpad; `steady-state-stream-qk`
+reads from the array's stationary registers afterward, not the buffer
+directly). Since DMA is idle and in-order with nothing else queued, tying
+it to `load-stationary(V, slice 7)` would just be an arbitrary, unforced
+delay — same class of mistake already rejected once for pairing
+`metadata-init` with `load-Q` in §11.11.
+
+Corrected: `load-K/V(K, chunk+2)` issues the instant `load-stationary(K,
+chunk c, slice 7)` finishes; `load-K/V(V, chunk+2)` issues the instant
+`steady-state-stream-v(chunk c, slice 7, head 7)` finishes (the V-buffer's
+own last reader) — this half was right from the start. Worked example,
+chunk 0→2 (`slice_start`=19,760): `K(chunk 2)` issues at 19,888→20,048;
+`V(chunk 2)` issues at 22,560→22,720 (same cycle chunk 1's slice 0
+begins). Generalizes to `c`=0..6 by shifting `slice_start` by `22,400c`.
+Margins are enormous either way (chunk 1's slice 0, which needs this data,
+doesn't start until `22,400c` later) — this correction changes *when* the
+prefetch fires by ~1,300 cycles, not whether it's safe.
+
+**Correction (§11.18): the V half was not right from the start — this
+was the exact same class of mistake as the K half, just missed at the
+time.** `steady-state-stream-v` doesn't read the V scratchpad at all,
+same as `steady-state-stream-qk` doesn't read the K scratchpad — both
+stream against the array's already-loaded stationary registers. The V
+buffer's real last reader is `load-stationary(V, slice 7)`, 1,272 cycles
+earlier than the gate used above. Also: the range in the paragraph above
+("chunks 0–6") and the worked example's "22,400c" generalization are both
+off by one — the boundary prefetch only happens on chunks 0–5's slice 7
+(chunk 6 and chunk 7's slice 7 have no `chunk+2` to fetch, since chunks 8
+and 9 don't exist). Corrected numbers and range now in
+`bundle-schedule.md`'s DMA-overlay section directly.
+
+**Next**: the tail — re-derive with ceiling'd latencies (dependency chain
+already fixed: `softmax-finalize(head i)` gated by `steady-state-stream-v
+(head i)` of chunk 7/slice 7, not `softmax-update(head i)`, per the
+correction made earlier this session but not yet written up numerically),
+then transcribe into `bundle-schedule.md`.
+
+### 11.16 Tail transcribed — hand-schedule deliverable complete
+
+Re-derived with ceiling'd latencies, confirmed the shape already known
+(each head's `softmax-finalize`+`store-O` pair rides directly behind its
+own `steady-state-stream-v(head i)` in chunk 7/slice 7, no cross-head
+contention — SFU/DMA both idle otherwise, 37 cycles of tail work fits
+comfortably inside `v`'s own 159-cycle per-head cadence). Full numbers in
+`bundle-schedule.md`. `v(head 7)`'s finish (179,360) cross-checks exactly
+against the independently-derived chunk-7-finish figure
+(`160 + 8×22,400`).
+
+**Total Q-tile latency: 179,397 cycles** (`store-O(head 7)`'s finish) —
+the complete hand-schedule result, prologue through tail, all with
+ceiling'd latencies. This is the number Phase 3 will compare the automated
+scheduler against.
+
+**This closes out `bundle-schedule.md`'s five segments** (prologue, slice
+0, universal matmul-issue/SFU table + DMA overlay, chunk-boundary DMA,
+tail) — `spec.md`'s hand-scheduled bundle sequence deliverable is done.
+
