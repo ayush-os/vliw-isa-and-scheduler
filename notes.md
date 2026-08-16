@@ -1817,3 +1817,83 @@ here, unlike Itanium's real-world experience.
 
 **Next**: build the scoped automated scheduler.
 
+### 11.18 Independent audit of `bundle-schedule.md`: two real doc bugs fixed (zero cycle impact), and one potentially major finding about the occupancy model itself
+
+Before starting the automated scheduler, dispatched an independent agent
+to sanity-check `bundle-schedule.md` end to end (correctness, hazard
+completeness, missed optimizations), specifically to avoid just
+rubber-stamping the last several sessions' own work. Full report kept
+externally; findings below.
+
+**Real doc bugs found and fixed** (both zero cycle impact — corrections
+already applied to `bundle-schedule.md` and §11.15 above):
+1. The chunk-boundary DMA prefetch range was off by one — "slice 7 of
+   chunks 0–6" should be "chunks 0–5" (chunk 6 and 7's slice 7 have no
+   `chunk+2` to fetch).
+2. §11.15's V-buffer WAR-hazard gate was wrong — gated on
+   `steady-state-stream-v(head 7)` when it should be `load-stationary(V,
+   slice 7)`, exact same class of mistake already correctly avoided for
+   K one line up (`steady-state-stream-v` doesn't read the V scratchpad
+   at all, same as `-qk` doesn't read K's). This also silently caused a
+   real internal contradiction the audit caught independently: the old
+   gate had `V(chunk+2)` spilling into the next slice's first 160 cycles,
+   directly contradicting the "slices 1–6 genuinely idle" claim next to
+   it.
+
+**Validation, stronger than what was claimed before**: independent
+re-derivation of every table's arithmetic came back clean, every `isa.md`
+citation checked out, and — going further than our own "no avoidable
+stalls found" framing — the audit proved 179,397 cycles is the *exact*
+lower bound achievable under our stated occupancy model (matmul-issue is
+the sole bottleneck resource, 99.89% occupied, zero bubbles from cycle
+160 onward). No reordering inside the current model can save a cycle;
+that's now a proven claim, not a checked-and-not-disproven one. No new
+*live* hazard was found in a from-scratch re-enumeration of every shared
+resource (S, P, O, metadata, both scratchpad buffers, the array's
+stationary registers) — §11.8's hazard pass holds up.
+
+**The major finding, not yet acted on — flagged for real discussion, not
+just accepted:** the audit argues the busy-for-full-latency occupancy
+model (§11.8) conflates *latency* with *occupancy* for
+`steady-state-stream-qk`/`-v`. The 159-cycle figure was itself derived
+(§11.4) as `N + D − 1` (32-cycle feed + 128-cycle drain) — a systolic
+*pipeline* latency formula, not evidence the array's input port stays
+busy for all 159 cycles. Since all 8 heads within a slice's K-phase (or
+V-phase) stream against the *same* stationary data (`load-stationary`
+loads once per slice), the audit argues there's no physical reason
+head `i+1`'s feed couldn't start the cycle after head `i`'s own 32-cycle
+feed completes, rather than waiting for head `i`'s full 159-cycle drain —
+which would mean real occupancy is 32 cycles/stream, not 159. Claimed
+impact if correct: **~33,000 cycles instead of 179,397 (≈5.5× faster)**,
+with matmul-issue utilization rising from 18.3% to 100% (cross-checked
+independently against the workload's raw MAC-bound floor:
+5.369×10⁸ MACs / 16,384 MAC-cycle⁻¹ = 32,768 cycles — matches).
+
+Companion, smaller, and independent of the above: `load-stationary`
+(16,384 cycles/Q-tile, 9.1% of the matmul slot) is currently fully
+serialized ahead of any stream. A second "shadow" stationary register
+(matching Gemmini's real `PRELOAD`/`COMPUTE` split, already cited in this
+project — §5.2/`notes.md` line ~280 — but read as mutually-exclusive
+occupancy rather than the double-buffered-weights mechanism it actually
+is) would let the next slice's `load-stationary` hide under the current
+slice's streaming: 128 &lt; 159, fully hideable. Claimed impact: 163,141
+cycles (9.06% faster) standalone, and a structural prerequisite for the
+bigger claim above (which needs 128 cycles of preload hidden under a
+256-cycle feed window).
+
+**Not accepted or rejected yet — deliberately.** This contradicts an
+explicit, reasoned §11.8 decision ("physically forced... same physical
+PEs"), and if right, invalidates the latency/occupancy model everywhere
+in this project, not just this one schedule — real rework across Phase 1
+(capacity/timing) and all of Phase 2 (the whole `bundle-schedule.md`) if
+adopted, which is a large enough cost that it deserves a real
+investigation (checked against `prefill_notes.md`'s actual hardware
+hypothesis, not just against internal consistency of the argument) before
+committing either way. Deliberately not starting the automated scheduler
+until this is resolved, since building it against the current occupancy
+model would be wasted work if the model changes.
+
+**Next**: investigate both findings (the `load-stationary` shadow-register
+idea and the systolic-pipelining occupancy question) and decide whether
+either is worth adopting before building the automated scheduler.
+
