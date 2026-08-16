@@ -1524,8 +1524,20 @@ program. Chunk 0's entire slice loop contains zero DMA instructions, so
 `load-K/V(K, chunk 1)` is already DMA's literal next instruction after
 the prologue's `V(chunk 0)` — whether it's textually written inside the
 prologue block or left at the end of chunk 0's loop iteration produces
-the identical schedule. **Folded into the prologue in `phase2-loop.md`
-for clarity — this was a zero-cost move, not an optimization.**
+the identical schedule.
+
+**Correction (caught in the §11.13 bundle-transcription session): this was
+never actually edited into `phase2-loop.md`.** The line above originally
+claimed it had been "folded into the prologue... for clarity," but the
+file still has it as the trailing lines inside `for chunk in 0..7`
+(`phase2-loop.md:54-55`) — the claim was aspirational, not done. On
+reflection, not worth doing now either: moving just chunk 0's trailing
+prefetch up would mean peeling chunk 0 out of the loop the same way
+chunk 7 already is for the epilogue, real structural complexity for a
+change that's explicitly schedule-*identical* either way (the whole point
+of this section) — same "no benefit to moving it" call already made for
+chunk 2's prefetch two paragraphs down. Left exactly as it already sits in
+`phase2-loop.md`; this note is the actual record now, not a to-do.
 
 Checked whether the same move should be made for chunk 2's prefetch
 (`load-K/V(K/V, chunk 2)`, which needs the *other* double-buffer instance
@@ -1569,7 +1581,9 @@ done:
    Q-tile's tail (cross-iteration software pipelining, the same Itanium
    technique cited since §1.1) has never been asked, because it was
    scoped away — a deliberate choice, not a gap that was missed, but
-   worth being explicit that it's still open.
+   worth being explicit that it's still open. **Update, §11.17: evaluated
+   on real numbers (≈0.09% of total runtime) and deliberately dropped, not
+   picked up.**
 4. **"No avoidable stalls found" is a more honest claim than
    "optimized."** Everything checked out because the hard architectural
    constraints (one stationary operand at a time; the softmax recurrence's
