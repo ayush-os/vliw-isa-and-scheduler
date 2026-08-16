@@ -2001,3 +2001,546 @@ before/after comparison Phase 3 will want, not as the current answer.
 4. *Then* build the automated scheduler (§11.17's scoping still applies),
    now against the corrected occupancy model so the comparison is
    meaningful.
+
+### 11.20 Sequencing decision: `load-stationary` shadow register punted; explicit occupancy table for the confirmed fix
+
+**Sequencing decision, made before starting §11.19 item 1**: do the
+stream-occupancy fix alone first; treat the `load-stationary`
+shadow-register idea as a separate follow-on, not side-by-side. Reasons:
+the stream fix is confirmed three independent ways (Timeloop, the audit's
+MAC-bound derivation, the cross-multiplication — §11.19), while the
+shadow register is unconfirmed by anything in this project (checked: the
+existing Gemmini `PRELOAD`/`COMPUTE` citation, §5.1, is about instruction
+taxonomy, not a real double-buffered-weights mechanism). Bundling an
+unconfirmed change into the same rebuild as a confirmed one would make
+every downstream hazard number contingent on an unverified assumption,
+and would repeat the exact ordering mistake already corrected once in
+this project (interleaving/placement before the base occupancy model was
+settled — see the "How to work with me" bullet in `handoff.md`). Net:
+`load-stationary` stays fully serialized ahead of its slice's streams for
+now; this rebuild targets the ≈49,000-cycle stream-fix-alone figure, not
+the ≈33,000-cycle combined one.
+
+**Explicit occupancy table**, resolving §11.19 item 1's "confirm the
+corrected rule precisely." The key clarification: *latency* (issue →
+result ready) is unchanged for every instruction — nothing about any
+`N+D−1` or DMA-bandwidth derivation from Phase 1/§11.4 was wrong.
+*Occupancy* (cycles before the slot can accept its next issue) is the
+concept that was missing, and it only diverges from latency for the two
+streams — the value isn't a new derivation, it's `N` from the existing
+`N+D−1=159` breakdown (§11.4), just adopted as occupancy instead of
+conflated with latency.
+
+| Instruction | Latency | Occupancy | Why |
+|---|---|---|---|
+| `load-stationary` | 128 | 128 | No feed/drain split exists for it — every cycle loads a distinct new row into the array (checked informally already, §11.19 item 1's parenthetical); physically forced regardless (same physical PEs). |
+| `steady-state-stream-qk` / `-v` | 159 (`N+D−1`, unchanged) | **32** (`N`, the feed count) | This is the actual fix. Next head's feed can start the cycle after the current head's own 32-cycle feed completes — it doesn't need to wait for the 128-cycle drain tail, since the drain is pipelined *behind* the feed of the next head, not blocking it. Confirmed, not just argued (§11.19). |
+| `softmax-update` / `softmax-finalize` / `metadata-init` | 32 | 32 | Occupancy=latency here was always a §11.8 *choice* (cheap given ~55% idle slack, avoids OOO-style completion tracking), not a physical claim — untouched by the audit, and SFU's own internal pipeline depth is deliberately unmodeled per the latency table's existing footnote. |
+| `load-K/V` | 160 | 160 | Not a systolic pipeline — no feed/drain structure to conflate. Untouched. |
+| `load-Q` / `store-O` | 5 | 5 | Same. |
+
+**Next**: full hazard re-pass (§11.19 item 2) under this table — S
+double-buffer margin (expected to go to ~zero, may need ×2→×4) and P/O
+ordering margin (audit estimate ~380 cycles, needs a real check) are the
+two flagged items; metadata recurrence and DMA hazards are expected
+unaffected but worth a from-scratch sanity pass since absolute cycle
+numbers shift throughout.
+
+### 11.21 S hazard re-derived with real numbers: ×2 leaves ~1 cycle margin, adopted ×4 instead
+
+Worked the S double-buffer hazard cycle-by-cycle under the corrected
+model (heads issue 32 apart, but a stream's actual write to S/O trickles
+out during its *drain* phase — the last 32 of its 159 latency cycles,
+`[issue+128, issue+159]` — which follows directly from the existing
+`N+D−1` derivation, not a new assumption). Real numbers, head 0 vs. head 2
+(same S-buffer parity under ×2): `qk(head 0)` issues at 288, writes S0
+across [416,447]; `softmax-update(head 0)` runs [447,479]; `qk(head 2)`
+issues at 288+2×32=352, its earliest S0 write lands at 352+128=480.
+**Margin = 480−479 = 1 cycle.** Positive, not negative — ×2 technically
+survives — but with zero room for any unmodeled effect (e.g. whether
+`softmax-update` genuinely needs *all* 32 rows before starting, which its
+own latency table footnote already flags as unverified) or for the kind
+of off-by-one this project has already produced twice (§11.12, and again
+mid-derivation this session on the head-cadence arithmetic).
+
+**Decision: adopt ×4 instead of ×2.** Reasoning: static scheduling gives
+precision against *runtime* jitter, not against *derivation* error — a
+1-cycle margin has zero tolerance for the latter, and this project has a
+real track record of exactly that failure mode in this class of
+computation. Cost is negligible: S already had ~94 KB of accumulator
+slack (`isa.md` §5); ×4 costs an extra 32 KB. With ×4 (`head_idx & 3`,
+still zero new instruction bits — 2 of the existing 3 head-idx bits are
+just reused instead of 1), the same-buffer reuse period doubles from 2
+heads to 4: head 4 (not head 2) shares head 0's buffer, issuing at
+288+4×32=416, earliest write at 416+128=544. **Margin = 544−479 = 65
+cycles** — real headroom instead of a razor's edge. Applied in `isa.md`
+§3/§5 (buffer selector, capacity table) and throughout the schedule
+rebuild below.
+
+### 11.22 Full hazard re-pass under the corrected model: everything besides S survives, some by construction rather than margin
+
+Went through every item in §11.8's original hazard list against the
+corrected occupancy model:
+
+- **Array stationary registers ("one operand at a time")**: re-confirmed,
+  and clarified exactly what it requires now that occupancy≠latency for
+  streams — `load-stationary` was always gated by the *prior stream's
+  full completion* (§11.8's original "forces `load-stationary` to wait
+  for the prior stream to finish," true then and unchanged now), never by
+  occupancy. This isn't a new rule; it only becomes numerically visible
+  now that occupancy (32) and latency (159) diverge for streams — under
+  the old model they were equal, so the two phrasings were
+  indistinguishable. Consequence: `load-stationary(V, slice N)` issues at
+  `qk(head 7)`'s full-latency completion, not its occupancy-freed cycle —
+  this produces a real, unavoidable **127-cycle idle bubble** on
+  matmul-issue at every K→V and V→K transition (§11.23 below), since no
+  shadow register exists to hide it (punted, see "Next" below).
+- **P (×8 per-head, WAR across slices)**: real numbers, not just
+  "safe by construction" as before. `steady-state-stream-v(head 0)`
+  reads P[head 0] during its feed window, done by 639+32=671 cycles
+  (slice-N-local). Slice N+1's `softmax-update(head 0)` — same cadence
+  derivation as `qk`, starts at Δ287 relative to its own slice start
+  (1,022 cycles later) = 1,309 absolute. **Margin ≈ 638 cycles** —
+  comfortable, because P's reuse period is once per ~1,022-cycle slice,
+  not once per 64-cycle (2-head) window like S. No buffering change
+  needed.
+- **O accumulator (rescale-then-add ordering)**: confirmed safe, and by
+  construction rather than margin — every K-phase `softmax-update`
+  (including the last, head 7, finishing at Δ543) completes well before
+  the V-phase even begins (Δ639), which falls directly out of the
+  `load-stationary` full-latency gating rule above. Not a numeric-margin
+  question at all.
+- **Metadata (`m`,`l`) recurrence across chunks**: unaffected by the fix,
+  confirmed still safe by construction — genuine RAW chain on a single
+  in-order SFU slot, which is safe regardless of absolute cycle numbers
+  by definition (a slot's own prior write always precedes its own next
+  read of it, in-order).
+- **`metadata-init` base case**: unaffected, still enormous margin — all
+  8 instances finish within the prologue's first ~256 SFU cycles,
+  untouched by the stream-occupancy fix.
+- **`softmax-finalize`→`store-O` (tail)**: revisited in detail in §11.24
+  below — safe, but the margin story changed qualitatively, not just
+  numerically.
+- **DMA (chunk-boundary prefetch)**: revisited with real numbers in
+  §11.23 below — still safe, margin shrinks from ~23,500 to ~8,400
+  cycles, nowhere near tight.
+
+**Net: S was the only hazard that actually broke.** Everything else
+survives the corrected model, via a mix of real (smaller but comfortable)
+numeric margins and by-construction guarantees that were never
+timing-dependent in the first place.
+
+### 11.23 `bundle-schedule-v2.md`: full rebuild under the corrected model
+
+New file, not an edit to the old one — `bundle-schedule.md` (179,397
+cycles) stays as-is, preserved for the before/after comparison, with its
+existing superseded banner now pointing at the replacement.
+
+**Prologue**: identical through cycle 288 to the old schedule — nothing
+in it depends on stream occupancy (`load-stationary(K, slice 0)` is gated
+by `load-K/V(K, chunk 0)` finishing at 160, `metadata-init`/`load-Q`
+cadence is SFU/DMA-only). Diverges at the row after 288: old model's next
+event was at 447 (159-cycle spacing), this model's is at 320 (32-cycle
+spacing).
+
+**Slice 0 / universal table**: derived cycle-by-cycle (`bundle-schedule-v2.md`
+has the full tables). Key numbers: K-phase heads issue 32 apart starting
+at Δ128, `load-stationary(V)` gated by `qk(head 7)`'s full latency at
+Δ511 (not its Δ384 occupancy-free point — the 127-cycle bubble from
+§11.22), V-phase heads issue 32 apart starting at Δ639, slice ends at
+Δ1,022. **New slice length: 1,022 cycles**, down from 2,800.
+
+**DMA overlay / chunk-boundary**: same four structural cases as the old
+schedule (slice 0 = prologue continuation, slices 1–6 idle, slice 7 =
+chunk+2 prefetch, chunks 6–7 = no prefetch) — the reasoning behind them
+(DMA in-order, nothing else competing, fires the instant its WAR gate
+clears) never depended on occupancy values, so it carries over unchanged.
+Only the literal cycle numbers changed. Worked chunk 0→2: `load-K/V(K,
+chunk 2)` issues at 7,442 (gated by `load-stationary(K, slice 7)`'s
+completion), `load-K/V(V, chunk 2)` at 7,953 — both finish inside chunk
+0's own slice 7 window. **Margin ≈ 8,399 cycles**, down from ~23,500 but
+nowhere close to tight. Confirmed zero DMA-induced stall anywhere in the
+Q-tile (`chunk_start(c+1) = chunk_start(c) + 8,176` holds exactly for all
+`c`): within a chunk, all 8 slices reuse the same already-resident K/V
+buffer, so matmul-issue never touches DMA mid-chunk; every chunk's
+prefetch (checked for chunks 0, 1, and the general `c`≥2 case) finishes
+thousands of cycles before it's needed.
+
+### 11.24 Tail re-derived: same rule, genuinely different SFU margin story — and it generalizes to the whole K-phase
+
+`softmax-finalize(head i)` gated by `steady-state-stream-v(head i)`'s
+full latency (same reasoning as `softmax-update`/S — needs *all* of O's
+rows written, only true at full completion), `store-O(head i)` follows
+immediately — same rule as `bundle-schedule.md`. But the numbers reveal a
+real qualitative change, not just smaller magnitudes: chunk 7/slice 7
+starts at 64,546; `v(head 0)` finishes at 65,344; `finalize(head 0)`
+finishes at 65,376 — which is *exactly* `v(head 1)`'s own finish time
+(65,344+32), because `v`'s occupancy (32) now exactly equals
+`finalize`'s own occupancy (32). Every `finalize(head i+1)` starts the
+instant `finalize(head i)` ends — SFU runs the entire tail at **zero
+idle cycles**, versus the old model's huge slack (159-cycle `v` cadence
+vs. 37-cycle `finalize`+`store-O`). Still hazard-free (32=32 is an exact
+match, not a shortfall) but resting on a coincidence, not margin — same
+category of concern as S's 1-cycle case in §11.21, and it directly
+revives the SFU latency table's own "internal pipeline depth not
+modeled, unlikely to matter" caveat as a live question rather than a safe
+assumption. **`store-O`/DMA still has real slack** (~27 idle cycles
+between consecutive `store-O`s) — this exact-saturation effect is SFU-only.
+
+**Generalizes beyond the tail**: the same back-to-back, zero-gap pattern
+already exists in the K-phase's `softmax-update` sequence in the Slice 0
+table (§11.23) — 447→479→511→543→575→607→639→671→703, fully contiguous.
+So SFU flips from "~55% idle, comfortable slack" (the original Phase 1
+characterization) to **100% utilized during every active window** (K-phase's
+256-cycle burst, and the tail), though its *overall* duty cycle per slice
+is still ~25% (idle during `load-stationary` and all of V-phase, where
+nothing schedules SFU work). Not a new hazard, but a real shift in SFU's
+risk profile that's worth remembering wherever the "SFU has slack, this
+detail doesn't matter" reasoning gets reused later.
+
+**Total Q-tile latency: 65,605 cycles** (chunk 7/head 7's `store-O`
+completion) — down from 179,397, a **2.73× speedup** from the
+stream-occupancy fix alone (`load-stationary` still fully serialized,
+shadow register not adopted). Full tables: `bundle-schedule-v2.md`.
+
+### 11.25 Hand-schedule deliverable (spec.md's Phase 2 ask) is now complete under the corrected model; two real items remain before Phase 2 is fully closed out
+
+`bundle-schedule-v2.md` satisfies `spec.md`'s literal Phase 2 hand-schedule
+requirement — same status `bundle-schedule.md` held before the occupancy
+bug was found. Two things remain, both already scoped, neither part of
+the hand-schedule deliverable itself:
+
+1. **`load-stationary` shadow register — worth a real investigation now,
+   given a real number.** Punted in §11.20 pending confirmation (Gemmini's
+   own RTL doesn't validate double-buffered weight overlap, only the
+   PRELOAD/COMPUTE instruction split). The 127-cycle-per-transition bubble
+   quantified in §11.22/§11.23 (~254 cycles/slice, ~16,300 cycles total
+   across 64 slices, ~25% of the streaming portion) is a real, non-trivial
+   cost — unlike cross-iteration pipelining (§11.17, ≈0.09% of runtime,
+   correctly dropped), this clears the bar for being worth a real
+   mechanism/hazard check. If adopted, it would mean a further
+   `bundle-schedule-v3.md` rebuild (`bundle-schedule-v2.md` would become
+   the next before/after baseline, same role `bundle-schedule.md` plays
+   for `-v2`).
+2. **Automated scheduler (§11.17's scoped-down list-scheduler)** — not
+   started. Same logic that motivated fixing the occupancy model before
+   ever starting this applies again: building it against a model that
+   might still change (if the shadow register is adopted) risks wasted
+   work, so item 1 should resolve first.
+
+**Next**: investigate the shadow-register mechanism on its own merits
+(real hazard/mechanism check, matching how S/P/O were each closed out
+with real numbers, not precedent alone); then the automated scheduler.
+
+### 11.26 Shadow-register investigation: real, and confirmed in Gemmini's actual RTL — stronger evidence than what was available at the punt
+
+Checked three independent primary sources rather than relying on the
+project's earlier (higher-level) look:
+
+1. **Gemmini's README/ISA docs**: silent. `matmul.preload` commits in one
+   cycle, then "the systolic array remains idle until the subsequent
+   OS/WS specific instructions are seen" — no discussion of overlap.
+2. **The original Gemmini paper** (Genç et al.): describes the tile/PE
+   pipeline architecture generally, no discussion of back-to-back
+   weight-stationary throughput or PE-level weight double-buffering.
+3. **Gemmini's actual RTL source, `PE.scala`**: settles it, positively.
+   Every PE has **two registers for the stationary value, `c1` and `c2`**,
+   gated by a `propagate` control signal (`COMPUTE=0`/`PROPAGATE=1`). In
+   weight-stationary mode: when `prop === PROPAGATE`, `c1` feeds forward
+   into the compute datapath while `c2` simultaneously receives new
+   input; roles swap otherwise. Real, hardware-level double-buffered
+   stationary registers — structurally exactly the shadow-register idea.
+
+**Why this is stronger than the original punt's basis**: the punt
+(§11.19/§11.20) only checked the README/instruction-taxonomy level
+(`PRELOAD` vs. `COMPUTE` exist as separate ops) — never opened `PE.scala`.
+Same category of gap Phase 1d's own §4.6 already flagged and corrected
+once ("pure grep/naming archaeology has a real ceiling — reading the
+actual Chisel source directly is what settles it," `prefill_notes.md`
+§4.8). Doing that here reverses the earlier "unconfirmed" verdict.
+
+**What's still genuinely open, not swept under the rug**: the public docs
+don't describe this mechanism at the *instruction* level at all — not
+fully confirmed whether Gemmini's compiler exposes a way to trigger a
+full ~128-cycle preload of an independent next tile overlapping a full
+~159-cycle previous compute (our exact use case), vs. this `c1`/`c2`
+ping-pong being a narrower internal detail of one preload→compute
+transition. Fully closing that would need reading `ExecuteController.sv`'s
+actual sequencing logic (same primary-source approach that resolved the
+axis-routing question in Phase 1d) — not done here. Judged sufficient to
+adopt given real RTL-level confirmation of the underlying mechanism,
+consistent with how much confidence this project's other Gemmini-grounded
+decisions have required.
+
+**Decision: adopt.** Real, not fabricated, and better-grounded than
+general accelerator-literature precedent (TPU's Weight FIFO/double
+buffering was also checked as corroborating context — real and
+well-documented, but a different accelerator; the Gemmini RTL finding is
+the load-bearing evidence here since it's this project's own reference
+implementation).
+
+### 11.27 Real impact re-derived — "cost → 0" was an overstatement, caught before it propagated into the rebuild
+
+Initial framing (this session) claimed the shadow register makes
+`load-stationary`'s cost "basically 0." Checked and corrected before
+building anything on it:
+
+**What's NOT true**: `load-stationary` cannot overlap with the *active*
+issuance burst of a stream phase — during a phase's 8 heads (256 cycles,
+occupancy 32 × 8, back-to-back, zero gaps), the single matmul-issue slot
+is already fully packed. No free issue cycle exists there regardless of
+the shadow register.
+
+**What IS true**: the shadow register eliminates the *bubble after the
+last head* — `load-stationary(V, slice N)` now issues right when
+`qk(head 7)`'s occupancy frees the slot (Δ384) instead of waiting for its
+full 159-cycle latency (Δ511), saving exactly the 127-cycle gap
+(`latency−occupancy`). Symmetric at the V→K transition.
+
+**But `load-stationary`'s own 128 cycles remain real, unavoidable
+occupancy** — the loaded operand isn't *active* until the load's own full
+128 cycles complete, and nothing else can issue on the single matmul-issue
+slot while it's mid-load. Real new slice length, recomputed component by
+component: `128 (load-stat K) + 256 (qk, 8×32) + 128 (load-stat V) + 256
+(v, 8×32) = 768` — down from 1,022, **not down to ~0 additional cost**.
+Cross-checked via issue-to-issue spans: 224 (qk head0→head7 issue-to-issue)
++ 160 (gap: 32 remaining qk(head7) occupancy + 128 load-stat) + 224 (v
+span) + 160 (gap) = 768. Matches.
+
+**Interesting cross-check against the original audit's numbers**: 64
+slices × 768 ≈ 49,150 lands close to the audit's original "~49,000,
+stream-fix-alone" estimate (§11.19) — which was already flagged as too
+optimistic for stream-fix-*alone* (real answer there, without the shadow
+register, is 65,605, §11.24). Looks like that estimate was actually
+closer to what *both* fixes together produce, just mislabeled at the
+time. The audit's "~33,000, both together" figure is also now revealed as
+too optimistic — it implicitly assumed something close to zero
+`load-stationary` cost, which isn't achievable without a structurally
+separate weight-load port (a bigger ISA change, not part of this
+adoption). Real answer for both fixes together: see §11.28.
+
+### 11.28 Hazard re-pass under the shadow-register model: S untouched, P and O both shrink by exactly 127 cycles (same root cause), one old justification breaks and needs replacing
+
+Checked every cross-boundary hazard against the new model rather than
+assuming "no S/P/O buffer issues" was free:
+
+- **S (×4)**: confirmed **unaffected**. S's hazard is entirely
+  intra-K-phase (head `i` vs. `i+4`, both inside one phase's 224-cycle
+  burst) — untouched by a fix that only changes the transition *between*
+  phases. Margin stays 65 cycles.
+- **P (WAR across slices)**: margin shrinks **638 → 511** cycles. Real
+  shrinkage, not "unaffected" — P's hazard spans exactly the K→V-then-next-K
+  boundary that just compressed by 127 cycles per transition. Still safe.
+- **O (rescale-then-add)**: margin shrinks **320 → 193** cycles — same
+  127-cycle shrink, same root cause (both P and O are gated by the same
+  compressed transition). **The old justification literally breaks**:
+  §11.22 argued safety via "every K-phase `softmax-update` finishes
+  before any V-phase `v` starts" — no longer true (`v(head 0)` now issues
+  at Δ512, before `softmax-update(head 7)` finishes at Δ543). Not
+  actually unsafe: the real requirement is per-head
+  (`softmax-update(i)` vs. `v(i)`, same `i` — different heads' O
+  locations never conflict, already ×8), and that margin is a *constant*
+  193 cycles regardless of head (`v(i)` issues at `512+32i`,
+  `softmax-update(i)` finishes at `319+32i` — the `+32i` terms cancel).
+  Worth remembering: a hazard justification that held under one model
+  doesn't automatically transfer to the next — this one needed
+  re-deriving from scratch, and happened to still hold, for a different
+  reason than before.
+- **Metadata recurrence, DMA**: genuinely unaffected (same-slot in-order
+  RAW chain; DMA margin shrinks proportionally with the shorter chunk —
+  6,240 cycles at the tightest point, still nowhere close to DMA's own
+  ~320-cycle need).
+
+**`bundle-schedule-v3.md` built against this model. Total: 49,476
+cycles** — 1.33× faster than `-v2` (65,605), 3.63× faster than the
+original (179,397), still 1.51× above the theoretical 32,768 MAC-bound
+floor (real, structural gap: `load-stationary` still consumes 33% of
+every slice's matmul-issue-slot cycles, since it shares the single issue
+slot with the compute streams — the shadow register fixed the *data*
+hazard, not the *issue-bandwidth* constraint). Full tables:
+`bundle-schedule-v3.md`.
+
+**Phase 2 status**: hand-schedule deliverable now fully settled at
+49,476 cycles. Per `spec.md`, Phase 2 requires *both* a hand-scheduled
+and an automated bundle sequence — the hand-schedule half is done;
+**the automated scheduler (§11.17's scoped-down list-scheduler) is the
+one remaining item before Phase 2 as a whole is closed out.**
+
+### 11.29 Independent Opus audit of `bundle-schedule-v3.md` and `isa.md`: one finding of the same magnitude class as the shadow register, one real bug in the automated-scheduler handoff spec, one recorded number wrong by 7×
+
+Dispatched before starting the automated scheduler, same rationale as
+§11.18's audit — catch what earlier passes (including that first audit)
+missed, rather than build the next phase against an unverified number.
+Full findings below; all arithmetic and hazard margins in
+`bundle-schedule-v3.md` were independently re-derived and came back
+clean — every finding here is structural, not a cycle-count error.
+
+**1. `load-stationary`'s remaining 256 cycles/slice is more avoidable
+than §11.24's "would need a bigger ISA change" framing suggested —
+confirmed against real Gemmini RTL, not just argued.** The audit read
+`ExecuteController.scala` directly (the file §11.26 flagged as the
+remaining open question) and found a real overlap-compute-and-preload
+path (`perform_mul_pre`, independent per-operand fire counters) — genuine
+instruction-level overlap of a preload with a compute, not just the
+`PE.scala` register-level double-buffer §11.26 already found. Combined
+with `PE.scala`'s weight-chain/psum-chain separation (`mac_unit.io.in_b
+:= c2` vs. `io.out_b := mac_unit.io.out_d` — physically different wires),
+a full weight load costs **zero cycles of the activation/psum datapath**
+in the reference hardware — overlappable with *active streaming*, not
+just with drain. Recomputed schedule if this ISA had an independent
+weight-load feeder (not sharing the matmul-issue slot): slice = `256 (qk)
++ 256 (v)` = 512, both `load-stationary`s fully hidden inside them. Total:
+**33,220 cycles** (prologue 288, 64×512=32,768, tail overhead 452) — a
+further **1.49×** over `-v3`, landing 1.4% above the 32,768 MAC-bound
+floor. This is genuinely a **new instruction-set decision** (a 4th slot,
+or a fused `stream-and-preload` opcode), not adoptable as a same-ISA
+timing fix the way the shadow register was — the audit is explicit that
+Gemmini's own fused mul-pre couples preload+compute as one command with
+shared `total_rows`, so spreading a 128-row preload across four 32-row
+streams isn't literally what Gemmini's ISA does; this project would need
+to design the affordance itself. Real precedent for the *mechanism*
+(separate weight/psum datapaths), not for this project's specific
+encoding of it. **Not yet decided whether to pursue — see "Next" below.**
+
+**2. Real correctness bug in `handoff.md`'s automated-scheduler
+handoff, now fixed.** The hazard list stated "array stationary
+registers... enforced automatically by slot serialization" — true under
+v1/v2 (occupancy=latency for streams made this a free consequence), but
+**false under v3**: `load-stationary` can now issue while a *different*
+prior stream is still draining out of the other register, so slot
+serialization no longer implies register safety. The real constraint
+(derived by the audit, re-verified here): `load-stationary` writing
+register X must wait for X's *last reader* — the stream phase *two*
+phases back, not one — to fully drain (full latency). Margin in the
+actual hand-schedule: **257 cycles**, safe, but nowhere stated as its own
+explicit constraint before this — a greedy scheduler built to the old
+spec had no guard against violating it. Fixed in `handoff.md`'s hazard
+list directly (this session, before any scheduler work started against
+the old spec).
+
+**3. Cross-Q-tile pipelining's recorded math (§11.17) was wrong by
+~7×, though the conclusion survives.** Audit re-derived the percentage
+independently, as asked (rather than trusting the "conclusion doesn't
+change so not worth recomputing" note from §11.17 itself — the *numerator*
+had also changed, not just the denominator that note flagged). Real
+total non-steady-state overhead: 160-cycle prologue + a **164-cycle tail
+gap** §11.17 never counted (matmul idle 49,312→49,476 while SFU/DMA
+finish) = 324 cycles against 49,476 total = **0.655%**, not 0.09%. Also:
+the prologue half is cheaper to capture than §11.17 claimed ("would mean
+redoing the whole hazard-then-schedule methodology one level up") — the
+audit shows it's just two extra `load-K/V` prefetch instructions with
+~6,500 cycles of DMA slack, not a new prologue/epilogue structure. Still
+**correctly left dropped** (0.655% is still genuinely negligible), but
+the recorded reasoning was wrong on the number, on what's at stake, and
+on the cost of capturing the prologue half specifically. Also checked (at
+the project owner's request, re: a similar issue found in a different
+project): K/V double-buffer parity, `load-Q` timing, and aggregate HBM
+bandwidth all check out clean across Q-tile boundaries — no analogous
+cross-Q-tile problem found beyond the already-known prologue/tail gap.
+
+**4. SFU-saturation "curiosity" (§11.24) is a real sensitivity cliff, not
+just a noted oddity, and it's the actual blocker for capturing finding
+3's tail half.** Under any cross-Q-tile overlap attempt, SFU would need
+24 instructions (8 `finalize` + 8 `metadata-init` + next tile's 8
+`softmax-update`) through a window that only fits ~22 — **oversubscribed
+by ~160 cycles**, and delaying the next tile's `softmax-update(head 0)`
+to compensate breaks the S hazard outright (`qk(head 4)` of the new tile
+would write S[0] before `softmax-update(head 0)` reads it). Separately:
+the schedule is only correct because SFU's occupancy (32 cycles — already
+flagged in the latency table as "no real hardware anchor") happens to be
+≤48; at exactly 32 there's zero absorption anywhere in the schedule for
+that unanchored number to be wrong by. Also: §11.8's original reason for
+choosing occupancy=latency for SFU ("costs nothing given their slack")
+no longer holds under v3 (SFU has no slack in its active windows) — the
+choice still doesn't cost cycles, but §11.28's hazard re-pass didn't
+revisit this specific stale justification the way it did O's.
+
+**5. Fallback if the ISA can't change: `tile_q`=64 gives 16.7% for zero
+encoding cost, but is blocked by 4,096 B of accumulator budget** — and
+`prefill_notes.md` §7 already logs accumulator capacity as swept-never
+"real free parameter (128–512 KB)." At 512 KB (Gemmini's own published
+"BigSP" config), `tile_q`=64 fits comfortably. **Subsumed by finding 1**
+if that's pursued (a weight-load slot makes `tile_q` irrelevant to this
+overhead entirely) — recorded as the fallback, not an addition.
+
+**6. Minor, all fixed this session, zero cycle impact**: `isa.md`'s S
+buffer justification said "head `i+2`" (survives from the ×2 design,
+should be `i+4` under ×4 — a real bug introduced when §11.21 did the ×2→×4
+edit, caught by the audit, not self-caught); two mislabeled "idle" cells
+in `bundle-schedule-v3.md`'s universal table (Δ383 matmul-issue and Δ512
+SFU were both still mid-occupancy, not idle — `bundle-schedule-v2.md` has
+the identical defect, not fixed there since it's already superseded); the
+SFU duty-cycle figure carried over from `-v2` (25%) without updating for
+the shorter slice (real number: 256/768=33%); `notes.md` §11.26 cites
+`ExecuteController.sv` — Gemmini is Chisel, the real file is
+`ExecuteController.scala`, the `.sv` is generated output. Also flagged,
+not fixed (no decision needed, just worth recording): one Q-tile's fully
+unrolled program is 49,476 bundles × 33 bits ≈ 199 KB, of which only
+~1.2% of slot-entries are non-NOP — never previously computed, but the
+fixed-width bundle-layout conclusion (`isa.md` §4) is if anything
+*strengthened* by it, not threatened (occupancy went from ~1% under v1 to
+~3.5% under v3, i.e. progressively less wasteful, not more).
+
+**What checked out clean, independently re-derived rather than trusted**:
+every cycle number in `bundle-schedule-v3.md` (slice/chunk lengths, the
+full tail table, all three speedup ratios); every hazard margin (S=65,
+P=511, O=193, all re-derived from scratch); the full DMA WAR chain
+end-to-end; `isa.md` §5's capacity tables; the shadow-register premise
+itself (finding 1 if anything *strengthens* confidence in it, not
+weakens it — no risk of reverting toward `-v2`).
+
+**Next, genuinely undecided — a real judgment call, not resolved here**:
+whether finding 1 (a weight-load-slot ISA extension, ~1.49× further,
+33,220 cycles) is worth pursuing now, before the automated scheduler, the
+same way the shadow register was — or whether to bank it as a known,
+quantified future opportunity and proceed to the automated scheduler
+against the current 49,476-cycle `-v3` target as planned.
+
+### 11.30 Decision: pursue the ISA extension next; automated scheduler's status changed from "required" to "open"
+
+Investigated finding 1's feasibility before deciding (not just estimating
+magnitude): checked whether the array can physically support a weight-feed
+and an activation-feed running concurrently, since that's the actual
+crux of whether this is buildable or a much bigger redesign than it
+first looks. Found real, positive evidence: Gemmini's `MeshWithDelays`
+module feeds three independent operands (`A`, `B`, `D`) into the array
+**simultaneously, one row each per cycle, as its normal mode of
+operation** — not a special case invented for this question. `B` (the
+stationary/weight path) and `A` (the moving/stream path) are already on
+physically separate channels in the reference hardware; that's the actual
+precondition that makes the audit's `perform_mul_pre` overlap finding
+(§11.29) possible at all. So the underlying mechanism isn't speculative —
+it's a real, already-provisioned feature of the hardware this project
+targets. The gap is entirely on this project's own bundle-format side
+(one shared opcode field for all matmul-issue work), which is a bounded,
+well-precedented extension to design, not an open-ended redesign.
+
+**Decision, made explicitly rather than defaulting to `spec.md`'s
+checklist**: pursue this ISA extension next, sequenced before the
+automated scheduler (same "settle the model before building against it"
+logic as every previous sequencing call this session). Real reasoning for
+prioritizing it over the scheduler: comparable magnitude to the shadow
+register (1.49× vs. 1.33×), genuinely new learning content (the first
+time this project has had to ask how many independent operand paths the
+array really has and whether the ISA exposes them — a real codesign
+question, not a rehash), and confirmed to be the last major lever
+(1.4% remains after it, matching the user's own instinct going in).
+
+**`spec.md`'s Phase 2 "both a hand-scheduled and an automated sequence"
+requirement is explicitly being treated as a starting point, not a
+binding constraint** — direct correction from the project owner to a
+framing I'd been carrying since §11.25 (that the automated scheduler was
+"the one remaining item... required before Phase 2 is closed out").
+`spec.md` was already established as a non-binding checklist for scope
+decisions once before (§11.17's own framing: "`spec.md` is a starting
+point, not the reason to do work that isn't worth its time cost") — this
+extends that same stance to whether a stated deliverable happens at all,
+not just to optional side-quests. **Automated scheduler status: open,
+not required, to be revisited after the ISA extension** — may or may not
+happen depending on how that revisit goes.
+
+**Next**: design the ISA extension (encoding approach, hazard
+re-derivation under genuine A/B-path concurrency, capacity recheck),
+target 33,220 cycles, `bundle-schedule-v4.md`. Full brief for a fresh
+session: `handoff.md`'s "Starting fresh on the ISA extension" section.
+
