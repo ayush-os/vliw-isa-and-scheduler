@@ -1753,3 +1753,67 @@ scheduler against.
 0, universal matmul-issue/SFU table + DMA overlay, chunk-boundary DMA,
 tail) — `spec.md`'s hand-scheduled bundle sequence deliverable is done.
 
+### 11.17 Roadmap for the rest of Phase 2, evaluated on learning-value-to-time, not `spec.md` as a checklist
+
+Two items were sitting in the "not yet done" list: cross-iteration
+software pipelining, and the automated scheduler. Explicitly evaluated
+both rather than doing either just because `spec.md` mentions them —
+`spec.md` is a starting point, not the reason to do work that isn't worth
+its time cost.
+
+**Cross-iteration software pipelining — evaluated and dropped, not
+deferred.** Real numbers, not a vibe: the savings are the ~160-cycle
+prologue wait that recurs once per Q-tile, × 65,536 Q-tiles (the outer
+`batch`/`kv_group`/`q_tile` loops excluded from `phase2-loop.md`'s scope)
+≈ 10.5M cycles. Against the full workload's total cost (65,536 ×
+179,397 ≈ 11.76 billion cycles), that's **≈0.09% of total runtime**. The
+technique itself — Itanium-style rotating-register cross-iteration
+overlap — is already this project's standing conceptual reference point
+from Phase 0's background reading (§1.1), cited repeatedly since; actually
+implementing it here would mean re-running Phase 2's entire
+hazard-then-schedule methodology one level up (the S double-buffer and
+accumulator state would need their own cross-Q-tile hazard pass, a new
+outer prologue/steady-state/epilogue structure) for a fractional-percent
+win. Bad time-to-learning ratio on both axes — the concept isn't new
+territory, and the payoff is negligible even at this workload's real
+scale. **Decision: not doing this**, and not calling it "still open" going
+forward — it was genuinely evaluated, not skipped by default.
+
+**Automated scheduler — worth doing, scoped down from `spec.md`'s literal
+"real list-scheduling/software-pipelining algorithms."** The actual reason
+it's worth the time: it's the only way to test the hand-schedule's own
+unresolved caveat from §11.12 — "no avoidable stalls found" was
+explicitly flagged as weaker than "optimal," since no alternative
+orderings were ever tried or compared, only checked for correctness.
+Skipping the automated scheduler would leave that claim asserted rather
+than tested, and would collapse Phase 3's three-way comparison to two-way
+(hand vs. Gemmini-serial), losing the actual Itanium-relevant question
+(does static scheduling by a real algorithm match hand-tuning?) this
+project has been building toward since Phase 0's Decision 2.
+
+**But scoped to what the comparison actually needs**, not full CS243
+generality: this problem is a single basic block (no control flow — zero
+branch instructions in this ISA, a standing design fact), 3 resource slots
+with fixed full-latency occupancy (§11.8's decided model), no register
+allocation. A greedy list-scheduler over the same dependency graph already
+derived in §11.8 (S double-buffer WAR hazard, P/O cross-slice ordering,
+metadata recurrence, all the DMA WAR hazards from §11.15) is sufficient —
+no need to build generalized modulo-scheduling machinery for loop-carried
+dependencies this problem doesn't have (cross-iteration pipelining was
+just ruled out above, so there's no loop-carried scheduling problem to
+solve for).
+
+**Prediction, on record before building it so it's checkable
+afterward**: given how constraint-bound the hand schedule turned out to
+be — matmul-issue is the real bottleneck almost everywhere, SFU/DMA sit
+idle because there's genuinely nothing for them to do (not from
+scheduling slack, per the exact idle-slack numbers in `isa.md` §4 and
+§11.8's hazard pass) — expect the automated result to land very close to
+179,397 cycles. If true, that's itself the interesting Phase 3 finding:
+confirms this workload's hard architectural constraints (one stationary
+operand at a time; the softmax recurrence's sequential chunk dependency)
+leave little room for a compiler to either win or lose against hand-tuning
+here, unlike Itanium's real-world experience.
+
+**Next**: build the scoped automated scheduler.
+
