@@ -1,18 +1,18 @@
 # Bundle schedule — hand-scheduled (Phase 2 deliverable)
 
-> **SUPERSEDED — read `notes.md` §11.19 before trusting any number below.**
-> This entire schedule (179,397 cycles) was built on a slot-occupancy
-> model (busy for an instruction's *full* latency, including a systolic
-> stream's drain time) that an independent audit found — and
-> `prefill_notes.md` §3.1's own Timeloop results confirm exactly — is
-> wrong: a real 128×128 array can sustain much higher throughput than
-> this model assumed (Timeloop measured 100% utilization on the identical
-> array; this schedule implies ~18%). Decision made (§11.19): fix the
-> occupancy model and re-derive this file from scratch *before* building
-> the automated scheduler. Everything below is preserved as the correct
-> answer to the *old* model — useful for the eventual before/after
+> **SUPERSEDED — see [`bundle-schedule-v2.md`](bundle-schedule-v2.md) for
+> the current schedule.** This entire schedule (179,397 cycles) was built
+> on a slot-occupancy model (busy for an instruction's *full* latency,
+> including a systolic stream's drain time) that an independent audit
+> found — and `prefill_notes.md` §3.1's own Timeloop results confirm
+> exactly — is wrong: a real 128×128 array can sustain much higher
+> throughput than this model assumed (Timeloop measured 100% utilization
+> on the identical array; this schedule implies ~18%). Fixed in
+> `bundle-schedule-v2.md` (65,605 cycles, 2.73× faster; `notes.md`
+> §11.19–§11.24 has the full re-derivation). Everything below is preserved
+> as the correct answer to the *old* model — useful for the before/after
 > comparison, not the current truth. **Do not build the automated
-> scheduler against these numbers.**
+> scheduler against these numbers — use `bundle-schedule-v2.md`.**
 
 The hand-scheduled bundle sequence `spec.md`'s Phase 2 requires, for the
 loop nest in `phase2-loop.md` against the ISA in `isa.md`. Derivation,
