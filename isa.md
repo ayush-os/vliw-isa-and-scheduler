@@ -47,7 +47,7 @@ softmax granularity) for one head — issued once per (chunk, slice, head).
 | Field | Width | Meaning |
 |---|---|---|
 | opcode | — | `steady-state-stream-qk` |
-| head-idx | 3 bits | Addresses the Q source (fixed Q-region-base + idx). Destination (raw S) is one of two double-buffered accumulator locations, selected by head-idx's low bit (`head_idx & 1`) — zero new bits, since head-idx is already carried for Q addressing. Double-buffered (not single) because `softmax-update(head i)` must finish reading S before `steady-state-stream-qk(head i+1)` can safely overwrite it — a single shared location would force a stall every head transition (`notes.md` §11.8). |
+| head-idx | 3 bits | Addresses the Q source (fixed Q-region-base + idx). Destination (raw S) is one of **four** buffered accumulator locations, selected by head-idx's low 2 bits (`head_idx & 3`) — zero new bits, since head-idx is already carried for Q addressing. Buffered (not single) because `softmax-update(head i)` must finish reading S before `steady-state-stream-qk(head i+4)` can safely overwrite it (the ×4 buffer means heads `i` and `i+4` share a location) — a single shared location would force a stall every head transition. ×4, not ×2: under the corrected occupancy model (`notes.md` §11.19–§11.21), ×2 leaves only ~1 cycle of real margin; ×4 gives ~65 cycles. |
 
 - No length field — always `tile_q`=32.
 - No dataflow-select field.
@@ -102,7 +102,7 @@ contribution for one head, matching `steady-state-stream-qk`'s granularity
 | opcode | — | `softmax-update` |
 | head-idx | 3 bits | Resolves metadata (`m`,`l`), output (`O`), and P against three different hardcoded bases. |
 
-- **Reads**: S (one of two double-buffered accumulator locations, selected by head-idx's low bit — zero new bits, read-only — never written by this instruction), metadata (head-idx), output `O` (head-idx).
+- **Reads**: S (one of four buffered accumulator locations, selected by head-idx's low 2 bits — zero new bits, read-only — never written by this instruction), metadata (head-idx), output `O` (head-idx).
 - **Writes**: metadata (head-idx), output `O` (head-idx — rescale written in place), P (scratchpad, head-idx).
 - `m`/`l`/`O` are persistent, incrementally-updated state — exactly one
   instance per head regardless of scheduling. **P is not** — it's a fresh
@@ -257,8 +257,8 @@ no parsing required to decode.
 | Region | Size |
 |---|---|
 | Per-head metadata (`m`,`l`) + output accumulator `O`, combined (§2.3's original `8×520×tile_q` term) | 133,120 B |
-| Raw-S (double-buffered, fp32 — `notes.md` §11.8) | 32,768 B |
-| **Total** | **165,888 B** (slack ≈ 94 KB) |
+| Raw-S (×4 buffered, fp32 — corrected occupancy model, `notes.md` §11.19–§11.21; was ×2/32,768 B under the original full-latency occupancy assumption) | 65,536 B |
+| **Total** | **198,656 B** (slack ≈ 62 KB) |
 
 Both fit comfortably. Underlying address-bus widths (RTL detail, not
 instruction-encoding — these never appear as instruction bits, since the
