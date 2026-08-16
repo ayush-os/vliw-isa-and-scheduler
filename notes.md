@@ -1095,8 +1095,28 @@ load-bearing; revisit only if a real schedule turns out SFU-bound.
 | `steady-state-stream-qk` / `-v` | 159 |
 | `softmax-update` / `softmax-finalize` | 32 |
 | `metadata-init` | 32 (added §11.9/§11.11 — writes `O` (32×128) through the same per-row write path `softmax-update`/`-finalize` use, so assumed to share their 32-cycle shape rather than being near-instant) |
-| `load-K/V` | 159.844 (raw, pre-clock) |
-| `load-Q` / `store-O` | 4.995 (raw, pre-clock) |
+| `load-K/V` | **160** (⌈159.844⌉ — see correction below) |
+| `load-Q` / `store-O` | **5** (⌈4.995⌉ — see correction below) |
+
+**Correction, caught while building the actual bundle table (§11.13 pickup):**
+the raw `159.844`/`4.995` DMA figures were carried through every downstream
+cycle-number derivation (§11.11's prologue timeline, §11.12's slice-0/
+chunk/tail figures) as literal fractional-cycle latencies, and that's
+physically wrong for this design — one bundle issues per clock, so a slot
+can't hand off a result mid-cycle; the earliest a dependent instruction can
+actually see it is the next cycle boundary. **Rule: ceiling each DMA
+instruction's own latency to the next whole cycle independently** (not
+round-to-nearest, and not accumulated/banked across separate instruction
+instances). `load-K/V`: ⌈159.844⌉=160; `load-Q`/`store-O`: ⌈4.995⌉=5. Every
+`.844`/`.839`/etc. cycle number appearing earlier in §11.11/§11.12
+(287.844, 446.844, 22,559.844, the 179,396.839 tail figure, etc.) is stale
+and superseded by this fix — none of it had been transcribed into a file
+yet when this was caught, so no rework debt, but don't trust those exact
+figures if reading this section out of order. Structural findings
+(K→Q×8→V DMA ordering, margin sizes, hazard-free conclusions) are
+unaffected — the shifts are ~1-5 cycles per instruction, nowhere close to
+closing any of the margins already found. Re-derivation with corrected
+latencies starts at §11.13.
 
 ### 11.5 Clock decision: 1 GHz
 
