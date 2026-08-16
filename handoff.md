@@ -1,8 +1,12 @@
 # Handoff — start here in a new chat
 
 This project is a **pedagogical exercise**, not a "get it built" task. Read
-this whole file before doing anything else, then pick up at **Phase 2**
-(§ below) — Phase 0 and Phase 1 are complete.
+this whole file before doing anything else. Phase 0 and Phase 1 are
+complete. **Phase 2's real pickup point right now is fixing a major
+occupancy-model bug**, not the automated scheduler — see the "Phase 2"
+section below, and read `notes.md` §11.19 before touching anything in
+`bundle-schedule.md` (currently marked superseded at the top of that
+file).
 
 ## How to work with me on this project
 
@@ -53,11 +57,21 @@ giver**:
   (`notes.md` §5.3) — reach for a small worked example before a longer
   abstract argument when a mechanism claim feels unsettled.
 - **Two modeling definitions locked in during Phase 2's bundle-scheduling
-  work, worth carrying forward exactly, not re-litigating**:
+  work, worth carrying forward exactly, not re-litigating — except the
+  specific occupancy rule in (1)'s parenthetical, which is now actively
+  being corrected, see `notes.md` §11.19 and "Project status" below
+  before assuming it still holds**:
   1. "Naive schedule" means every slot proceeds independently at its own
-     pace, gated only by its own occupancy (decided: busy for an
+     pace, gated only by its own occupancy (~~decided: busy for an
      instruction's full latency, uniform across all three slots — not
-     issue-and-free) and real data dependencies. It does **not** mean
+     issue-and-free~~ **superseded, §11.19: full-latency occupancy is
+     wrong for the two systolic-stream instructions specifically — it
+     conflates pipeline drain time with real issue occupancy, confirmed
+     against `prefill_notes.md`'s own Timeloop results. The
+     issue-and-free-vs-full-latency framing itself may need a third
+     option: full-latency for `load-stationary`/SFU/DMA, feed-rate for
+     the two streams — TBD, this is the open question**) and real data
+     dependencies. It does **not** mean
      artificially serializing independent slots, and it does **not** mean
      reordering/interleaving to manufacture more overlap than falls out
      for free — natural overlap between independent slots is just what
