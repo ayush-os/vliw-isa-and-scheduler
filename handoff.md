@@ -2,11 +2,27 @@
 
 This project is a **pedagogical exercise**, not a "get it built" task. Read
 this whole file before doing anything else. Phase 0 and Phase 1 are
-complete. **Phase 2's real pickup point right now is fixing a major
-occupancy-model bug**, not the automated scheduler — see the "Phase 2"
-section below, and read `notes.md` §11.19 before touching anything in
-`bundle-schedule.md` (currently marked superseded at the top of that
-file).
+complete. **The hand-schedule half of Phase 2 is settled for now** at
+[`bundle-schedule-v3.md`](bundle-schedule-v3.md) (**49,476 cycles**, down
+from 179,397 originally) — both the occupancy-model bug and the
+`load-stationary` shadow register are fixed/adopted. **The real pickup
+point right now is a new ISA extension**, not the automated scheduler: an
+independent audit (`notes.md` §11.29) found real evidence, in Gemmini's
+actual RTL, that the array can feed weight-load and streaming operands
+through genuinely separate physical ports concurrently — meaning
+`load-stationary`'s remaining 256 cycles/slice (33% of matmul-issue-slot
+time) is a limitation of *this project's own bundle format* (one shared
+issue slot), not the hardware. Pursuing this next, target **33,220
+cycles** (1.49× further, 1.4% above the theoretical floor) — see
+"Starting fresh on the ISA extension" below for the full brief.
+**`spec.md`'s "both a hand-scheduled and an automated sequence"
+requirement is being treated as a starting point, not a hard
+requirement** — explicit decision, the automated scheduler's status is
+now open, to be revisited after this extension, not a fixed commitment
+(`notes.md` §11.30). `bundle-schedule.md` (original, 179,397 cycles) and
+`bundle-schedule-v2.md` (stream-occupancy fix alone, 65,605 cycles) are
+both kept as before/after baselines — each marked superseded at its own
+top, pointing forward to the next version.
 
 ## How to work with me on this project
 
@@ -274,24 +290,48 @@ Full reasoning: `notes.md` §11.9. `isa.md` is current; every "8
 instructions" / "32 bits" reference elsewhere in this file (including
 just above) reflects Phase 1's state at the time and is superseded.
 
-## Phase 2: hand-schedule built and independently audited, then a major occupancy-model bug found — fixing it is the real next step, before the automated scheduler
+## Phase 2: hand-schedule at 49,476 cycles for now — pursuing one more ISA extension (target 33,220), automated scheduler status open
 
-**Status in one paragraph, read this first**: the hand-schedule got to a
-complete, internally-consistent 179,397-cycle answer (`bundle-schedule.md`),
-then an independent audit agent was dispatched to sanity-check it before
-building the automated scheduler. The audit found two small doc bugs
-(fixed) and one major finding: the slot-occupancy model itself (busy for
-an instruction's *full* latency) conflates a systolic pipeline's *drain
-time* with real issue *occupancy* for the two streaming instructions —
-confirmed against real Timeloop simulation data already on record in
-`prefill_notes.md` §3.1 (100% utilization is achievable on this exact
-array; this schedule implies ~18%). **Decision made (`notes.md` §11.19):
-fix this before building the automated scheduler**, since building it
-against a known-wrong occupancy model would be wasted work. Real
-potential impact: **~5.5× faster** (179,397 → ~33,000 cycles) if both the
-occupancy fix and a companion `load-stationary` shadow-register idea are
-adopted together — see §11.19 for the full breakdown, including which
-part is strongly confirmed vs. which part is plausible-but-unverified.
+**Status in one paragraph, read this first**: the hand-schedule went
+through three versions. **v1** (`bundle-schedule.md`, 179,397 cycles) was
+built on a slot-occupancy model (busy for an instruction's *full*
+latency, uniform across all three slots) that an independent audit found
+conflates a systolic pipeline's *drain time* with real issue *occupancy*
+for the two streaming instructions — confirmed against real Timeloop data
+in `prefill_notes.md` §3.1. **v2** (`bundle-schedule-v2.md`, 65,605
+cycles, `notes.md` §11.19–§11.24) fixed that: stream latency stays 159
+cycles (`N+D−1`), occupancy is 32 (`N`, the feed count). Full hazard
+re-pass done: S's double-buffer margin collapsed to ~1 cycle under the new
+model, so S is now **×4** (`isa.md` §3/§5); P/O, metadata, DMA all survive
+with real (smaller but comfortable) margins. v2 still fully serialized
+`load-stationary` ahead of its slice's streams, though, producing a real
+127-cycle idle bubble at every K↔V transition (~25% of each slice) — not
+a scheduling gap, a hard resource constraint (one physical set of weight
+registers, can't be overwritten until the prior stream fully drains).
+**v3** (`bundle-schedule-v3.md`, **49,476 cycles**, `notes.md`
+§11.26–§11.28) fixes that too: a `load-stationary` shadow register,
+confirmed *real* by reading Gemmini's actual RTL directly (`PE.scala` has
+two registers per PE, `c1`/`c2`, gated by a `propagate` signal — genuine
+double-buffered stationary storage, not fabricated, and stronger evidence
+than the higher-level README/paper check that originally punted this).
+`load-stationary`'s own 128-cycle occupancy is *not* eliminated (it still
+fully occupies the single matmul-issue slot) — only the *extra* bubble is,
+saving 127 of every 254 cycles per slice, not "all" of it (an earlier
+"cost → 0" framing this session was caught and corrected, `notes.md`
+§11.27). Hazard re-pass again: S unaffected (its hazard is intra-phase,
+untouched by an inter-phase-transition fix); P and O both shrink by
+exactly 127 cycles (638→511, 320→193) — same root cause, still safe; O's
+*old* safety justification actually breaks under the new timing and needs
+replacing with a real per-head check (still safe, for a different reason,
+`notes.md` §11.28).
+
+**Net result: 3.63× faster than the original hand-schedule**, landing at
+49,476 cycles — still 1.51× above the theoretical 32,768-cycle MAC-bound
+floor, a real structural gap (`load-stationary` still eats 33% of every
+slice's matmul-issue-slot cycles, since it shares the single issue slot
+with the compute streams — the shadow register fixed the *data* hazard,
+not the *issue-bandwidth* one; closing that would need a separate
+weight-load path, a bigger ISA change, not part of this).
 
 Per `spec.md` Phase 2: hand-schedule the real bundle sequence first
 (before the automated scheduler). **Full working log: `notes.md` §11**
@@ -401,13 +441,24 @@ this design; Timeloop's 2 GHz run was "int8-pumped," not a free bump) —
 assumed — margins ranging from ~70× (general, §11.6) up to ~23,500 cycles
 absolute (chunk 2's specific case, §11.12).
 
-**The hand-schedule deliverable is done.** [`bundle-schedule.md`](bundle-schedule.md)
-is the actual bundle table `spec.md` asks for — prologue, slice 0, a
-universal matmul-issue/SFU table (identical for every slice, parameterized
-by `slice_start`) with a per-slice DMA overlay, chunk-boundary DMA, and the
-tail, all with real cycle numbers. **Total Q-tile latency: 179,397
-cycles** — the number Phase 3 will compare the automated scheduler
-against. Full derivation, every correction, in `notes.md` §11.13–§11.16.
+**The hand-schedule deliverable is done, three times over.**
+[`bundle-schedule.md`](bundle-schedule.md) was the original answer — full
+bundle table, prologue through tail, real cycle numbers — built against
+the *wrong* occupancy model (busy-for-full-latency, uniform across all
+three slots). **179,397 cycles.** Full derivation, every correction:
+`notes.md` §11.13–§11.16. Kept as-is, not deleted, for the before/after
+comparison.
+
+[`bundle-schedule-v2.md`](bundle-schedule-v2.md) fixed the occupancy
+model (32-cycle stream occupancy, S at ×4) but still fully serializes
+`load-stationary` ahead of its slice's streams. **65,605 cycles — 2.73×
+faster than v1.** Full derivation: `notes.md` §11.19–§11.24.
+
+[`bundle-schedule-v3.md`](bundle-schedule-v3.md) is the current answer —
+adds a `load-stationary` shadow register (confirmed real in Gemmini's
+actual RTL, `notes.md` §11.26), removing the 127-cycle idle bubble v2 has
+at every K↔V transition. **49,476 cycles — 1.33× faster than v2, 3.63×
+faster than v1.** Full derivation: `notes.md` §11.26–§11.28.
 
 **One real modeling gap caught and fixed along the way, worth knowing
 about since it touches every cycle number in this project**: the
@@ -423,8 +474,8 @@ hazard-free conclusions) were never affected by this, only the exact
 numbers.
 
 **Roadmap for the rest of Phase 2 — evaluated on learning-value-to-time,
-not just followed from `spec.md`'s checklist** (`notes.md` §11.17 has the
-full reasoning):
+not just followed from `spec.md`'s checklist** (`notes.md` §11.17, §11.25,
+§11.26–§11.28 have the full reasoning):
 
 1. **Cross-iteration software pipelining: evaluated and deliberately
    dropped, not just deferred.** The savings are the ~160-cycle prologue
@@ -435,24 +486,48 @@ full reasoning):
    actually implementing it here would mean redoing Phase 2's whole
    hazard-then-schedule methodology at the outer-loop level for a
    fraction-of-a-percent win. Bad time-to-learning ratio — not picking
-   this up unless something changes that math.
-2. **Automated scheduler: the one real remaining item, scoped down.**
-   Worth doing — it's the only way to actually test the hand-schedule's
-   unverified "no avoidable stalls found ≠ optimal" caveat (§11.12) rather
-   than asserting it, and it's the direct payoff of the project's own
-   Phase 0 motivating question (does static scheduling match hand-tuning,
-   Itanium's real historical problem). **But scoped to what the
-   comparison actually needs, not full CS243 generality**: this problem
-   is one basic block, 3 fixed-occupancy resource slots, no control flow,
-   no register allocation — a greedy list-scheduler over the same
-   dependency graph already derived in §11.8 (S double-buffer, P/O
-   ordering, metadata recurrence) is enough. Prediction worth stating
-   before building it, so it's checkable afterward: given how
-   constraint-bound the hand schedule already was (matmul-issue is the
-   real bottleneck almost everywhere; SFU/DMA idle because there's
-   genuinely nothing for them to do, not from scheduling slack), expect
-   the automated result to land very close to 179,397 cycles — itself the
-   interesting finding if true.
+   this up unless something changes that math. (Note: the workload total
+   here still cites the pre-fix 179,397; not worth recomputing since the
+   conclusion — negligible percentage either way — doesn't change.)
+2. **`load-stationary` shadow register — done, adopted.** Was punted,
+   then investigated for real (`notes.md` §11.26): Gemmini's actual RTL
+   (`PE.scala`) has genuine double-buffered stationary registers (`c1`/
+   `c2`, gated by a `propagate` signal) — real, not fabricated, and
+   better-grounded than the higher-level docs check that originally
+   punted it. Adopted, rebuilt as `bundle-schedule-v3.md` (49,476 cycles,
+   1.33× faster than v2). An initial "this makes `load-stationary`'s cost
+   ~0" framing was too strong and got corrected (`notes.md` §11.27) — the
+   real saving is the 127-cycle bubble only, not the instruction's own
+   128-cycle occupancy, which is unavoidable given the single matmul-issue
+   slot.
+3. **`load-stationary`/stream concurrent-issue ISA extension — the
+   active next step** (`notes.md` §11.29–§11.30). An independent audit
+   read Gemmini's `ExecuteController.scala` and `PE.scala` directly and
+   found real evidence the reference hardware feeds weight (`B`) and
+   activation (`A`/`D`) operands through genuinely separate physical ports
+   *simultaneously, every cycle, as normal operation* — not a special
+   case. `load-stationary`'s remaining 256 cycles/slice (33% of
+   matmul-issue-slot time) is a limitation of this project's own
+   single-opcode bundle format, not the hardware. Target: **33,220
+   cycles** (1.49× further, 1.4% above the theoretical 32,768-cycle
+   floor) — see "Starting fresh on the ISA extension" below for the full
+   brief. Real, bounded work (bundle-width extension, hazard re-derivation
+   under genuine concurrency, one more schedule rebuild) — not adoptable
+   for free the way the shadow register was, but well-precedented, unlike
+   speculative redesign.
+4. **Automated scheduler — status now open, not a fixed requirement.**
+   `spec.md`'s "both a hand-scheduled and an automated sequence" framing
+   is being treated as a starting point, not binding (explicit project
+   decision, `notes.md` §11.30) — worth revisiting *after* item 3, not
+   before, and not guaranteed to happen at all. If pursued: still worth
+   doing for the reasons already on record (only way to test the
+   hand-schedule's "no avoidable stalls ≠ optimal" caveat, direct payoff
+   of the project's Phase 0 motivating question), still scoped down to a
+   greedy list-scheduler (not full CS243 generality) over the same
+   dependency graph already derived. See "Starting fresh on the automated
+   scheduler" below if picking this up instead of/after item 3 — that
+   section is unchanged and still accurate, just no longer the immediate
+   next step.
 
 **One framing to hold onto**: don't call the current derivation
 "optimized." "No avoidable stalls found" is the honest, weaker claim —
@@ -460,6 +535,168 @@ everything checked out mainly because the hard architectural constraints
 (one stationary operand at a time; the softmax recurrence's sequential
 chunk dependency) left little room to begin with, not because
 alternative orderings were tried and compared.
+
+## Starting fresh on the ISA extension — read this section first if you're picking this project up new
+
+Everything the audit and follow-up derived, consolidated in one place so
+you don't need to read all of §11's history to get moving.
+
+**Files to actually read**: `isa.md` (the ISA — 9 instructions, 3 slots),
+`bundle-schedule-v3.md` (current hand-schedule, the thing you're
+improving on), `phase2-loop.md` (the loop nest). `notes.md` §11.29–§11.30
+has the full audit findings and reasoning if you need to double-check
+something below.
+
+**The actual task**: `load-stationary` currently shares the single
+matmul-issue slot with the two stream instructions, so its 128-cycle
+occupancy fully blocks streaming even though the shadow register (already
+adopted, `-v3`) lets it write into an inactive register concurrently.
+Real Gemmini hardware feeds weight (`B`) and activation (`A`/`D`)
+operands through separate physical ports *simultaneously, every cycle, as
+normal operation* (confirmed via `MeshWithDelays`/`ExecuteController.scala`
+— not a special case, this is how the array always works) — so the
+underlying mechanism is real and precedented; the gap is purely that this
+project's own bundle format has no way to issue a weight-feed step and a
+stream step in the same cycle.
+
+**What needs deciding/designing** (genuinely open — this is real ISA
+design work, not mechanical transcription, same spirit as Phase 1's
+original slot decisions):
+1. **Encoding approach**: a second, independent matmul-related bundle
+   field (effectively a 4th slot) vs. a fused opcode that issues a stream
+   instruction and advances an in-progress weight-load simultaneously.
+   Trade-offs to work through: bundle-width cost, whether "weight-load
+   in progress" needs to be explicit state or can be inferred, how this
+   interacts with the existing `opcode`/`head-idx`/`src` fields already
+   in `isa.md` §1–§3.
+2. **Hazard re-derivation under genuine concurrency**: previous hazard
+   passes (S/P/O/metadata/DMA) all assumed instructions execute one at a
+   time on a given resource. With a weight-feed and a stream genuinely
+   concurrent, re-check whether any *new* hazard appears (e.g., does the
+   weight-feed's own progress interact with anything the stream touches?)
+   — expect this to be a smaller pass than S/P/O's original derivation,
+   since the two paths are physically independent in the reference
+   hardware, but don't assume, check.
+3. **Capacity/timing recheck**: confirm `isa.md` §5's capacity tables and
+   the latency/occupancy table still hold (should — this doesn't change
+   any instruction's own latency, only issue concurrency).
+4. **Schedule rebuild**: `bundle-schedule-v4.md`, same five-segment
+   structure as `-v2`/`-v3`. Target: **33,220 cycles** (audit's own
+   derivation, `notes.md` §11.29 — re-verify rather than take on faith,
+   same standard every number in this project has been held to). Expect
+   to land within ~1.4% of the theoretical 32,768-cycle MAC-bound floor —
+   if the real result is far off, that's a signal to double check the
+   model, not just accept it.
+
+**Honest scope note from the audit, worth remembering**: this is *not*
+adoptable for free the way the shadow register was (that was a pure
+timing-model correction, zero new ISA bits). This genuinely adds
+encoding — expect real bundle-width growth and a real (if likely modest)
+hazard pass, not a one-line fix.
+
+**On the automated scheduler**: status is now open, not a fixed
+requirement — `spec.md`'s two-deliverable framing for Phase 2 is being
+treated as a starting point, not binding (`notes.md` §11.30). Worth
+revisiting after this extension, not before. See the section below if/
+when that happens — it's unchanged and still accurate, just not the
+immediate next step.
+
+## Starting fresh on the automated scheduler — read this section if picking up the scheduler instead of/after the ISA extension above
+
+Everything the hand-schedule work derived, consolidated in one place so
+you don't need to read all of §11's history to get moving. The dependency
+graph and resource model below are **settled, not open questions** —
+don't re-derive them; the automated scheduler's job is to search over
+*ordering choices* within these fixed constraints, not to re-litigate the
+constraints themselves. Note: if the ISA extension above has been adopted
+by the time you read this, the resource model and target cycle count
+below are stale — check `bundle-schedule-v4.md` and `isa.md`'s current
+state first.
+
+**Files to actually read**: `isa.md` (the ISA — 9 instructions, 3 slots:
+matmul-issue/SFU/DMA), `phase2-loop.md` (the loop nest to schedule — one
+Q-tile's steady-state body), `bundle-schedule-v3.md` (the hand-scheduled
+answer to match/beat). `notes.md` §11 has the full derivation if you need
+to double-check something below, but shouldn't be required reading to
+start.
+
+**Resource model** — one instruction issues per cycle per slot (3 slots,
+in-order each), occupancy ≠ latency for two instruction types:
+
+| Instruction | Slot | Latency | Occupancy | Gating on issue |
+|---|---|---|---|---|
+| `load-stationary` | matmul-issue | 128 | 128 | Prior stream's *occupancy*-end (not full latency — shadow register adopted, confirmed real in Gemmini's RTL, `notes.md` §11.26) |
+| `steady-state-stream-qk`/`-v` | matmul-issue | 159 | **32** | Prior same-slot instruction's occupancy-end |
+| `softmax-update`/`-finalize`/`metadata-init` | SFU | 32 | 32 | Prior SFU instruction's occupancy-end, and its own data dependencies (below) |
+| `load-K/V` | DMA | 160 | 160 | Prior DMA instruction's occupancy-end, and WAR hazard (below) |
+| `load-Q`/`store-O` | DMA | 5 | 5 | Same |
+
+**Data dependencies / hazards already resolved** (don't re-derive, just encode):
+- **S** (raw accumulator, ×4 buffered, `head_idx & 3` selects buffer):
+  `steady-state-stream-qk(head i+4)`'s write must not start before
+  `softmax-update(head i)` finishes reading — same-parity heads only.
+- **P** (scratchpad, ×8 per-head): `softmax-update(head i)` of slice `N+1`
+  must not write P[head `i`] before `steady-state-stream-v(head i)` of
+  slice `N` finishes reading it (WAR, cross-slice).
+- **O** (accumulator, ×8 per-head): `softmax-update(head i)` must precede
+  `steady-state-stream-v(head i)` for the *same* head (rescale-then-add
+  ordering) — per-head only, different heads never conflict.
+- **metadata** (`m`,`l`, ×8 per-head): ordinary RAW chain across chunks,
+  automatically satisfied by correct program order on the in-order SFU
+  slot — needs no special scheduling logic beyond emitting instructions in
+  dependency order. `metadata-init(head i)` must precede that head's first
+  real `softmax-update` in the Q-tile (recurrence base case).
+- **DMA double-buffering** (K1/K2/V1/V2): a `load-K/V` targeting a given
+  buffer instance must not start before that instance's *last* reader
+  (`load-stationary` for the chunk currently occupying it) finishes (WAR).
+- **Array stationary registers — NOT automatically safe from slot
+  serialization, encode this explicitly.** True in v1/v2 (occupancy=latency
+  for streams, so slot serialization implied register safety for free);
+  **false under v3's shadow register**, which is precisely the point of
+  adopting it — `load-stationary` can now issue while a *different* prior
+  stream is still draining out of the other physical register. The real
+  constraint: `load-stationary` writing register X must not begin before
+  X's *last reader* — the stream phase *two* phases back, not one — has
+  fully drained (full latency, not occupancy). Confirmed margin in the
+  hand-schedule: 257 cycles, safe but not automatic — a naive
+  slot-serialization-only scheduler could produce a schedule that violates
+  this, so it must be its own explicit constraint, not assumed to follow
+  from the single-issue-slot property. Caught by the audit in §11.29,
+  not present in any hazard list before that.
+
+**Scope, already decided** (`notes.md` §11.17) — don't build more than
+this: one basic block (the steady-state body — no control flow, no
+branches in this ISA), no register allocation, no OOO/dynamic modeling
+(ruled out since Phase 0's Decision 2). **A greedy list-scheduler over the
+dependency graph above is sufficient.** No modulo-scheduling / software-
+pipelining machinery needed — cross-iteration pipelining was evaluated and
+explicitly dropped (negligible savings, item 1 above), so there's no
+loop-carried scheduling problem to solve.
+
+**Target**: **49,476 cycles** for one Q-tile (`bundle-schedule-v3.md`).
+Prediction on record, worth checking against once built: expect the
+automated result to land very close to this, since matmul-issue is the
+near-total bottleneck throughout and SFU/DMA are idle because there's
+genuinely nothing for them to do, not from scheduling slack — if the
+automated scheduler lands far off from 49,476 in either direction, that's
+itself a signal something in the model or the implementation is off,
+worth checking before trusting the number.
+
+**Genuinely open, not yet decided — ask the user rather than assume**:
+implementation language/tooling, where the code should live in this repo,
+and how success is validated (presumably: run it, compare its cycle count
+and bundle sequence against `bundle-schedule-v3.md`). None of this is
+specified anywhere in `spec.md` or prior sessions.
+
+**Working style, carries over unchanged**: sounding-board role, not
+answer-giver (see "How to work with me" at the top of this file) — but
+note that *building* the scheduler is closer to execution than to a
+derivation the user needs to walk themselves through (unlike the hand-
+schedule's own hazard/timing derivations, which were genuinely the user's
+learning target). Real *design* decisions within the scheduler (priority
+heuristic, tie-breaking, how ties in the dependency graph get resolved)
+are still worth surfacing as choices rather than silently picking one,
+consistent with how Phase 0/1's two 🧠-marked decisions were handled.
 
 ## Files in this repo
 
@@ -475,20 +712,39 @@ alternative orderings were tried and compared.
   *including every correction and dead end*, not smoothed over) + §10
   (a standalone cross-project GQA-reuse finding, unrelated to Phase 2) +
   §11 (Phase 2 — §11.1–§11.7 latency/clock groundwork, §11.8–§11.12 hazard
-  fixes + prologue/epilogue + slice-0/chunk-boundary derivation,
-  §11.13–§11.16 the bundle-table transcription with the ceiling-latency
-  correction, §11.17 the evaluated roadmap decision for the rest of Phase
-  2 — real pickup point is §11.17's "Next": the automated scheduler)
+  fixes + prologue/epilogue + slice-0/chunk-boundary derivation (original,
+  pre-occupancy-fix schedule), §11.13–§11.16 the original bundle-table
+  transcription, §11.17 the evaluated roadmap decision, §11.18 the
+  independent audit that found the occupancy bug, §11.19 the decision to
+  fix it, §11.20–§11.24 the occupancy re-derivation — occupancy table,
+  S ×4, P/O/metadata/DMA hazard re-pass, `bundle-schedule-v2.md`'s
+  derivation, the tail's SFU-saturation finding, §11.25 v2 status, §11.26
+  the shadow-register investigation (real, confirmed in Gemmini's
+  `PE.scala` RTL), §11.27 the "cost→0" overstatement caught and corrected,
+  §11.28 the hazard re-pass under the shadow-register model +
+  `bundle-schedule-v3.md`'s derivation — **current real pickup point:
+  §11.28's closing note — the automated scheduler is the one remaining
+  Phase 2 item**)
 - `phase2-loop.md` — the Phase 2 loop nest actually being hand-scheduled
   (one Q-tile's steady-state body), kept separate from `notes.md` so it's
   easy to reference by line number
-- `bundle-schedule.md` — **the complete hand-scheduled bundle sequence**,
-  `spec.md`'s literal Phase 2 deliverable, done: merged matmul-issue/SFU/
-  DMA table, one row per issue event, all five segments (prologue, slice
-  0, universal matmul-issue/SFU table + per-slice DMA overlay,
-  chunk-boundary DMA, tail). **Total Q-tile latency: 179,397 cycles.**
-  Clean deliverable only — derivation and format decisions are in
-  `notes.md` §11.13–§11.16.
+- `bundle-schedule.md` — **v1, superseded.** Built against the occupancy
+  model later found wrong (busy-for-full-latency, uniform across all
+  three slots). **179,397 cycles.** Kept as the before/after baseline.
+  Derivation: `notes.md` §11.13–§11.16.
+- `bundle-schedule-v2.md` — **v2, superseded.** Fixed the occupancy model
+  (32-cycle stream occupancy, S at ×4) but still fully serializes
+  `load-stationary`. **65,605 cycles** — 2.73× faster than v1. Kept as the
+  before/after baseline for the shadow-register fix specifically.
+  Derivation: `notes.md` §11.19–§11.24.
+- `bundle-schedule-v3.md` — **v3, current.** `spec.md`'s literal Phase 2
+  hand-schedule deliverable. Adds the `load-stationary` shadow register
+  (confirmed real in Gemmini's RTL): same five-segment structure, all real
+  cycle numbers. **Total Q-tile latency: 49,476 cycles** — 3.63× faster
+  than v1, 1.33× faster than v2, 1.51× above the theoretical 32,768-cycle
+  MAC-bound floor (a real, structural remainder — `load-stationary`'s own
+  occupancy, not further reducible without a separate weight-load port).
+  Derivation: `notes.md` §11.26–§11.28.
 - `handoff.md` — this file
 - `../workload-to-silicon/prefill_notes.md` — the real hardware hypothesis
   this ISA targets (128×128 array, WS dataflow, online-softmax, scratchpad
